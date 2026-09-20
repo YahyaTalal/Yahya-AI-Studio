@@ -1,0 +1,14 @@
+{
+  "task_id": "render_proj_myz3mmpw_602d0f",
+  "stage": "Rendering video",
+  "progress": 70,
+  "logs": [
+    "[04:47:45] Video rendering queued.",
+    "[04:47:45] Processing timeline layers...",
+    "[04:47:54] Assembled 6 visual clips and 0 audio clips.",
+    "[04:47:56] Compiling timeline (1920x1080, 24fps) to Exports..."
+  ],
+  "completed": false,
+  "failed": false,
+  "output_video": null
+}
