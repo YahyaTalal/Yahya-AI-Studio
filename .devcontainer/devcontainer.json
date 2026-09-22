@@ -1,0 +1,1 @@
+{"forwardPorts":[8000],"image":"mcr.microsoft.com/devcontainers/python:3.12","name":"Yahya AI Studio","portsAttributes":{"8000":{"label":"Yahya AI Studio","onAutoForward":"openPreview"}},"postCreateCommand":"pip install -r Backend/requirements.txt","postStartCommand":"nohup python live_server.py > /tmp/yahya-studio.log 2>&1 &","remoteEnv":{"DEV_AUTH_BYPASS":"1","PORT":"8000"}}

@@ -477,24 +477,20 @@ async def generate_voiceover(
     return f"/{out_path.replace(chr(92), '/')}"
 
 
-# Save the sync pexels search before overriding with async version
-_search_pexels_sync = search_pexels
-
-
-async def search_pexels(
+async def search_pexels_async(
     query: str,
     media_type: str = "video",
     page: int = 1,
     per_page: int = 20,
     api_key: str = "",
 ) -> dict:
-    """Async wrapper around the sync _search_pexels_sync function."""
+    """Async wrapper around the sync search_pexels function."""
     import asyncio
     ptype = "videos" if media_type in ("video", "videos") else "photos"
     loop = asyncio.get_event_loop()
     results = await loop.run_in_executor(
         None,
-        lambda: _search_pexels_sync(api_key, query, ptype, per_page)
+        lambda: search_pexels(api_key, query, ptype, per_page)
     )
     return {"results": results, "total": len(results), "page": page}
 

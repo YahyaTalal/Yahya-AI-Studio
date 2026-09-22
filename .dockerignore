@@ -1,0 +1,13 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+Frontend/node_modules/
+Media Library/
+Projects/
+Exports/
+exports/
+.venv/
+venv/
+.env
+.DS_Store

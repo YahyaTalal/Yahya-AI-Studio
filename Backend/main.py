@@ -8,7 +8,7 @@ import urllib.request
 import urllib.parse
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Query, APIRouter, Depends, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -22,12 +22,64 @@ from library_service import scan_media_library
 from video_generator import create_timeline_video, update_status
 import ai_service
 
+from auth import get_current_user
+from store import store_for_env
+
 app = FastAPI(title="Yahya AI Studio Backend")
 
+# Phase 1 accounts: every /api route below runs behind get_current_user.
+# DEV_AUTH_BYPASS=1 (local Windows flow) -> a local pseudo-user, no login.
+api = APIRouter(dependencies=[Depends(get_current_user)])
+store = store_for_env()
+AUTH_MODE = "bypass" if os.environ.get("DEV_AUTH_BYPASS", "") == "1" else "supabase"
+
+
+@app.get("/api/auth/status")
+def auth_status():
+    """Public: which auth mode this backend runs in. No login required."""
+    return {"mode": AUTH_MODE}
+
+# Data directory: all media/projects/exports live under DATA_DIR.
+# Set DATA_DIR=/var/data (or a Render Disk path) in production so files
+# survive restarts. Defaults to the current working directory.
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.chdir(DATA_DIR)
+
+def _safe_path(user_path: str) -> str:
+    """Resolve a user-supplied path and confine it inside DATA_DIR.
+
+    Blocks path traversal (../), hidden files/dirs and the Projects/
+    folder (which holds api_keys.json) so /api/serve-media and
+    /api/folder-scan can never leak secrets or system files.
+    """
+    p = Path(user_path.replace("\\", "/"))
+    if p.is_absolute():
+        p = Path(*p.parts[1:])
+    resolved = (Path(DATA_DIR).resolve() / p).resolve()
+    root = Path(DATA_DIR).resolve()
+    if root not in resolved.parents and resolved != root:
+        raise HTTPException(status_code=403, detail="Path outside data directory")
+    if any(part.startswith(".") for part in resolved.relative_to(root).parts):
+        raise HTTPException(status_code=403, detail="Hidden paths are not allowed")
+    if resolved.relative_to(root).parts[:1] == ("Projects",):
+        raise HTTPException(status_code=403, detail="Projects folder is not servable")
+    return str(resolved)
+
 # Setup CORS middleware
+# Same-origin deployments need no CORS; cross-origin UIs set ALLOWED_ORIGINS
+# as a comma-separated list, e.g. "https://studio.example.com".
+_allowed_origins = [
+    o.strip()
+    for o in os.environ.get(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://localhost:5173,http://localhost:8000,http://127.0.0.1:8000",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In dev, allow all
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,21 +96,6 @@ for folder in [
     "Exports", "Projects"
 ]:
     os.makedirs(folder, exist_ok=True)
-
-API_KEYS_PATH = "Projects/api_keys.json"
-
-def _load_api_keys() -> dict:
-    if os.path.exists(API_KEYS_PATH):
-        try:
-            with open(API_KEYS_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def _save_api_keys(keys: dict):
-    with open(API_KEYS_PATH, 'w', encoding='utf-8') as f:
-        json.dump(keys, f, indent=2)
 
 # Mount static files
 app.mount("/Media Library", StaticFiles(directory="Media Library"), name="media_library")
@@ -82,69 +119,40 @@ class ProjectSchema(BaseModel):
     fps: int
     tracks: Dict[str, List[Dict[str, Any]]]
 
-@app.get("/api/projects")
-def list_projects():
+@api.get("/api/projects")
+def list_projects(user=Depends(get_current_user)):
     try:
-        projects = []
-        for file in os.listdir("Projects"):
-            if file.startswith("project_") and file.endswith(".json"):
-                path = os.path.join("Projects", file)
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        projects.append({
-                            "id": data.get("id"),
-                            "name": data.get("name"),
-                            "duration": data.get("duration"),
-                            "updated_at": os.path.getmtime(path)
-                        })
-                except Exception:
-                    pass
-        # Sort by updated time desc
-        projects.sort(key=lambda x: x["updated_at"], reverse=True)
-        return projects
+        return store.list_projects(user.id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/projects/{project_id}")
-def load_project(project_id: str):
-    path = f"Projects/project_{project_id}.json"
-    if not os.path.exists(path):
+
+@api.get("/api/projects/{project_id}")
+def load_project(project_id: str, user=Depends(get_current_user)):
+    project = store.get_project(user.id, project_id)
+    if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return project
 
-@app.post("/api/projects")
-def save_project(project: ProjectSchema):
-    path = f"Projects/project_{project.id}.json"
+@api.post("/api/projects")
+def save_project(project: ProjectSchema, user=Depends(get_current_user)):
     try:
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(project.model_dump(), f, indent=2, ensure_ascii=False)
+        store.save_project(user.id, project.model_dump())
         return {"status": "success", "id": project.id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/projects/{project_id}")
-def delete_project(project_id: str):
-    path = f"Projects/project_{project_id}.json"
-    if os.path.exists(path):
-        try:
-            os.remove(path)
-            # Remove associated statuses or captions if any
-            for suffix in [f"status_{project_id}.json", f"captions_{project_id}.json"]:
-                p = f"Projects/{suffix}"
-                if os.path.exists(p):
-                    os.remove(p)
+@api.delete("/api/projects/{project_id}")
+def delete_project(project_id: str, user=Depends(get_current_user)):
+    try:
+        if store.delete_project(user.id, project_id):
             return {"status": "success"}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     raise HTTPException(status_code=404, detail="Project not found")
 
 # File Upload endpoint
-@app.post("/api/upload")
+@api.post("/api/upload")
 async def upload_file(
     file: UploadFile = File(...),
     type: str = Form(...)  # 'avatar', 'voiceover', 'music', 'stock', 'image'
@@ -186,7 +194,7 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 # Smart Upload endpoint — auto-detects media type and routes to correct folder
-@app.post("/api/upload/smart")
+@api.post("/api/upload/smart")
 async def smart_upload_file(file: UploadFile = File(...)):
     """
     Auto-detects media type from file extension/MIME and routes to:
@@ -247,7 +255,7 @@ async def smart_upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Smart upload failed: {str(e)}")
 
 # Media Library explorer endpoints
-@app.get("/api/library")
+@api.get("/api/library")
 def get_library_files():
     try:
         files = scan_media_library("Media Library")
@@ -266,7 +274,7 @@ def get_library_files():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/library/folder")
+@api.post("/api/library/folder")
 def create_library_folder(folder_path: str = Form(...)):
     try:
         clean_path = folder_path.replace("\\", "/").strip("/")
@@ -276,7 +284,7 @@ def create_library_folder(folder_path: str = Form(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/library/upload")
+@api.post("/api/library/upload")
 async def upload_to_folder(
     file: UploadFile = File(...),
     folder: str = Form(...)  # e.g. "Avatar", "Stock Videos"
@@ -308,7 +316,7 @@ class ScriptCaptionRequest(BaseModel):
     script_text: str
     duration: float
 
-@app.post("/api/captions/srt")
+@api.post("/api/captions/srt")
 async def generate_captions_from_srt(file: UploadFile = File(...)):
     try:
         contents = await file.read()
@@ -335,7 +343,7 @@ async def generate_captions_from_srt(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SRT parsing failed: {str(e)}")
 
-@app.post("/api/captions/script")
+@api.post("/api/captions/script")
 def generate_captions_from_script(req: ScriptCaptionRequest):
     try:
         words = req.script_text.strip().split()
@@ -360,7 +368,7 @@ def generate_captions_from_script(req: ScriptCaptionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/captions/auto")
+@api.post("/api/captions/auto")
 def generate_auto_captions(audio_path: str = Form(...)):
     # Run whisper
     if not os.path.exists(audio_path):
@@ -388,13 +396,14 @@ class TimelineRenderRequest(BaseModel):
     quality: str  # 'low', 'medium', 'high'
     format: str   # 'mp4'
 
-@app.post("/api/render")
-def trigger_render(req: TimelineRenderRequest):
+@api.post("/api/render")
+def trigger_render(req: TimelineRenderRequest, user=Depends(get_current_user)):
     task_id = f"render_{req.project_id}_{uuid.uuid4().hex[:6]}"
-    
+    user_id = user.id
+
     # Init status
     update_status(task_id, "Idle", 0, "Video rendering queued.")
-    
+
     def render_worker():
         try:
             create_timeline_video(
@@ -406,18 +415,35 @@ def trigger_render(req: TimelineRenderRequest):
             )
         except Exception as e:
             print(f"Background thread render error: {e}")
-            
+            return
+        # Online mode: the final mp4 must live in the user's Storage exports
+        # folder (the local disk is ephemeral). Temp files during the job
+        # stay on disk, which is fine for a single render.
+        if AUTH_MODE != "bypass":
+            try:
+                out = f"Exports/{task_id}.mp4"
+                st = {}
+                try:
+                    with open(f"Projects/status_{task_id}.json", "r", encoding="utf-8") as sf:
+                        st = json.load(sf)
+                except Exception:
+                    pass
+                if os.path.exists(out) and st.get("completed") and not st.get("failed"):
+                    store.record_export(user_id, task_id, req.project_id, out)
+            except Exception as e:
+                print(f"Export storage upload error: {e}")
+
     thread = threading.Thread(target=render_worker, name=f"render_{task_id}")
     thread.daemon = True
     thread.start()
-    
+
     return {
         "status": "queued",
         "task_id": task_id
     }
 
 # Status Poll endpoint
-@app.get("/api/status/{task_id}")
+@api.get("/api/status/{task_id}")
 def get_task_status(task_id: str):
     status_path = f"Projects/status_{task_id}.json"
     if not os.path.exists(status_path):
@@ -443,59 +469,17 @@ def get_task_status(task_id: str):
         }
 
 # Export History endpoint
-@app.get("/api/exports")
-def get_export_history():
+@api.get("/api/exports")
+def get_export_history(user=Depends(get_current_user)):
     try:
-        export_files = []
-        for file in os.listdir("Exports"):
-            if file.lower().endswith(".mp4"):
-                path = os.path.join("Exports", file)
-                stat = os.stat(path)
-                
-                # Check status if available
-                task_id = os.path.splitext(file)[0]
-                status_path = f"Projects/status_{task_id}.json"
-                stage = "Completed"
-                if os.path.exists(status_path):
-                    try:
-                        with open(status_path, 'r', encoding='utf-8') as sf:
-                            st = json.load(sf)
-                            if st.get("failed"):
-                                stage = "Failed"
-                            elif not st.get("completed"):
-                                stage = st.get("stage", "Rendering")
-                    except Exception:
-                        pass
-                        
-                export_files.append({
-                    "filename": file,
-                    "path": f"Exports/{file}",
-                    "size": stat.st_size,
-                    "created_at": stat.st_mtime,
-                    "task_id": task_id,
-                    "status": stage
-                })
-        # Sort by creation time desc
-        export_files.sort(key=lambda x: x["created_at"], reverse=True)
-        return export_files
+        return store.list_exports(user.id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/exports/{filename}")
-def delete_export(filename: str):
+@api.delete("/api/exports/{filename}")
+def delete_export(filename: str, user=Depends(get_current_user)):
     try:
-        path = os.path.join("Exports", filename)
-        if os.path.exists(path):
-            os.remove(path)
-            
-        # Clean status files
-        task_id = os.path.splitext(filename)[0]
-        for f in [f"Projects/status_{task_id}.json", f"Projects/captions_{task_id}.json"]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+        store.delete_export(user.id, filename)
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -505,39 +489,28 @@ def delete_export(filename: str):
 # API KEY MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/api-keys")
-def get_api_keys():
-    """Return saved API keys (masked for security)."""
-    keys = _load_api_keys()
-    masked = {}
-    for provider, key in keys.items():
-        if key:
-            masked[provider] = key[:8] + "*" * max(0, len(key) - 8)
-        else:
-            masked[provider] = ""
-    return {"keys": masked, "providers": list(keys.keys())}
+@api.get("/api/api-keys")
+def get_api_keys(user=Depends(get_current_user)):
+    """Return the user's saved API keys (masked for security)."""
+    keys = store.list_api_keys(user.id)
+    return {"keys": keys, "providers": list(keys.keys())}
 
-@app.post("/api/api-keys")
-def save_api_key(provider: str = Form(...), key: str = Form(...)):
-    """Save or update an API key for a provider."""
-    keys = _load_api_keys()
-    keys[provider.lower()] = key.strip()
-    _save_api_keys(keys)
+@api.post("/api/api-keys")
+def save_api_key(provider: str = Form(...), key: str = Form(...),
+                 user=Depends(get_current_user)):
+    """Save or update an API key for a provider (encrypted in online mode)."""
+    store.save_api_key(user.id, provider, key)
     return {"status": "saved", "provider": provider.lower()}
 
-@app.delete("/api/api-keys/{provider}")
-def delete_api_key(provider: str):
-    keys = _load_api_keys()
-    if provider.lower() in keys:
-        del keys[provider.lower()]
-        _save_api_keys(keys)
+@api.delete("/api/api-keys/{provider}")
+def delete_api_key(provider: str, user=Depends(get_current_user)):
+    store.delete_api_key(user.id, provider)
     return {"status": "deleted", "provider": provider.lower()}
 
-@app.post("/api/api-keys/test")
-def test_api_key(provider: str = Form(...)):
+@api.post("/api/api-keys/test")
+def test_api_key(provider: str = Form(...), user=Depends(get_current_user)):
     """Test whether the stored API key for a provider is valid."""
-    keys = _load_api_keys()
-    key = keys.get(provider.lower(), "")
+    key = store.get_api_key(user.id, provider)
     if not key:
         return {"valid": False, "error": "No key stored for this provider"}
     try:
@@ -555,11 +528,10 @@ def test_api_key(provider: str = Form(...)):
     except Exception as e:
         return {"valid": False, "error": str(e)}
 
-@app.get("/api/api-keys/reveal/{provider}")
-def reveal_api_key(provider: str):
+@api.get("/api/api-keys/reveal/{provider}")
+def reveal_api_key(provider: str, user=Depends(get_current_user)):
     """Reveal the full API key for a provider."""
-    keys = _load_api_keys()
-    key = keys.get(provider.lower(), "")
+    key = store.get_api_key(user.id, provider)
     return {"provider": provider.lower(), "key": key}
 
 
@@ -573,18 +545,17 @@ class ScriptRequest(BaseModel):
     style: str = "Documentary"
     provider: str = "gemini"
 
-@app.post("/api/generate-script")
-def generate_script(req: ScriptRequest):
-    keys = _load_api_keys()
+@api.post("/api/generate-script")
+def generate_script(req: ScriptRequest, user=Depends(get_current_user)):
     provider = req.provider.lower()
     try:
         if provider == "gemini":
-            key = keys.get("gemini", "")
+            key = store.get_api_key(user.id, "gemini")
             if not key:
                 raise HTTPException(status_code=400, detail="No Gemini API key stored. Go to API Keys panel.")
             script = ai_service.generate_script_gemini(key, req.title, req.description, req.style)
         elif provider == "groq":
-            key = keys.get("groq", "")
+            key = store.get_api_key(user.id, "groq")
             if not key:
                 raise HTTPException(status_code=400, detail="No Groq API key stored. Go to API Keys panel.")
             script = ai_service.generate_script_groq(key, req.title, req.description, req.style)
@@ -606,18 +577,17 @@ class ChatRequest(BaseModel):
     provider: str = "gemini"
     script_context: str = ""
 
-@app.post("/api/ai-chat")
-def ai_chat(req: ChatRequest):
-    keys = _load_api_keys()
+@api.post("/api/ai-chat")
+def ai_chat(req: ChatRequest, user=Depends(get_current_user)):
     provider = req.provider.lower()
     try:
         if provider == "gemini":
-            key = keys.get("gemini", "")
+            key = store.get_api_key(user.id, "gemini")
             if not key:
                 raise HTTPException(status_code=400, detail="No Gemini API key stored")
             reply = ai_service.ai_chat_gemini(key, req.messages, req.script_context)
         elif provider == "groq":
-            key = keys.get("groq", "")
+            key = store.get_api_key(user.id, "groq")
             if not key:
                 raise HTTPException(status_code=400, detail="No Groq API key stored")
             reply = ai_service.ai_chat_groq(key, req.messages, req.script_context)
@@ -634,14 +604,14 @@ def ai_chat(req: ChatRequest):
 # MEDIA SEARCH PROXY (Pexels + Pixabay)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/search/pexels")
+@api.get("/api/search/pexels")
 def search_pexels_route(
     query: str = Query(...),
     media_type: str = Query("videos"),
-    per_page: int = Query(10)
+    per_page: int = Query(10),
+    user=Depends(get_current_user)
 ):
-    keys = _load_api_keys()
-    key = keys.get("pexels", "")
+    key = store.get_api_key(user.id, "pexels")
     if not key:
         raise HTTPException(status_code=400, detail="No Pexels API key stored")
     try:
@@ -650,14 +620,14 @@ def search_pexels_route(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pexels search failed: {str(e)}")
 
-@app.get("/api/search/pixabay")
+@api.get("/api/search/pixabay")
 def search_pixabay_route(
     query: str = Query(...),
     media_type: str = Query("film"),
-    per_page: int = Query(10)
+    per_page: int = Query(10),
+    user=Depends(get_current_user)
 ):
-    keys = _load_api_keys()
-    key = keys.get("pixabay", "")
+    key = store.get_api_key(user.id, "pixabay")
     if not key:
         raise HTTPException(status_code=400, detail="No Pixabay API key stored")
     try:
@@ -667,92 +637,110 @@ def search_pixabay_route(
         raise HTTPException(status_code=500, detail=f"Pixabay search failed: {str(e)}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FOLDER SCAN
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/folder-scan")
-def folder_scan(
-    path: str = Query(...),
-    types: str = Query("mp4,mp3,jpg,jpeg,png,webp,gif,wav,mov,avi")
-):
-    try:
-        from pathlib import Path as P
-        allowed_ext = {f".{t.strip().lower()}" for t in types.split(",")}
-        folder = P(path)
-        if not folder.exists() or not folder.is_dir():
-            return {"status": "error", "files": [], "error": f"Folder not found: {path}"}
-        files = []
-        for f in sorted(folder.iterdir()):
-            if f.is_file() and f.suffix.lower() in allowed_ext:
-                files.append({
-                    "name": f.name,
-                    "path": str(f).replace("\\", "/"),
-                    "size": f.stat().st_size,
-                    "ext": f.suffix.lower()
-                })
-        return {"status": "ok", "files": files, "folder": str(folder)}
-    except Exception as e:
-        return {"status": "error", "files": [], "error": str(e)}
 
 
-@app.get("/api/list-video-folders")
-def list_video_folders():
-    try:
-        import os
-        folders = []
-        default_folder = "Media Library/Stock Videos"
-        if os.path.exists(default_folder):
-            folders.append(default_folder)
-            
-        # Scan Media Library recursively for folders containing mp4 files
-        if os.path.exists("Media Library"):
-            for root, dirs, files in os.walk("Media Library"):
-                has_mp4 = any(f.lower().endswith(".mp4") for f in files)
-                if has_mp4:
-                    rel_path = os.path.relpath(root, start=os.getcwd()).replace("\\", "/")
-                    if rel_path not in folders:
-                        folders.append(rel_path)
-        if not folders:
-            folders.append(default_folder)
-        return {"status": "ok", "folders": folders}
-    except Exception as e:
-        return {"status": "error", "folders": ["Media Library/Stock Videos"], "error": str(e)}
-
-
-@app.post("/api/select-folder")
-def select_folder():
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        folder_path = filedialog.askdirectory(title="Select Video Folder")
-        root.destroy()
-        if folder_path:
-            normalized = folder_path.replace("\\", "/")
-            return {"status": "ok", "path": normalized}
-        else:
-            return {"status": "cancelled", "path": ""}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@app.get("/api/serve-media")
+@api.get("/api/serve-media")
 def serve_media(path: str = Query(...)):
-    import os
-    normalized_path = path.replace("\\", "/")
-    if not os.path.exists(normalized_path):
-        raise HTTPException(status_code=404, detail=f"File not found: {normalized_path}")
-    return FileResponse(normalized_path)
+    # Online (supabase) mode: media comes from signed URLs; the disk is
+    # ephemeral, so direct disk serving is gone (410).
+    if AUTH_MODE != "bypass":
+        raise HTTPException(status_code=410, detail="Use the signed URLs from /api/media in online mode")
+    # Confined to DATA_DIR: blocks path traversal and the Projects/ folder
+    # (which holds api_keys.json), so media URLs can never leak secrets.
+    safe = _safe_path(path)
+    if not os.path.exists(safe):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(safe)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER-SCOPED MEDIA LIBRARY (Phase 1 — replaces local folder scan)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api.get("/api/media")
+def list_media(user=Depends(get_current_user)):
+    """List the user's media files. Each item carries `signed_url`
+    (supabase mode: time-limited Storage URL; bypass mode: /api/serve-media
+    URL). `url` is kept as an alias for compatibility."""
+    try:
+        items = store.media_list(user.id)
+        for it in items:
+            it.setdefault("signed_url", it.get("url"))
+        return items
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api.post("/api/media/upload")
+async def upload_media(
+    file: UploadFile = File(...),
+    kind: str = Form("other"),  # video | image | audio | voiceover | other
+    user=Depends(get_current_user)
+):
+    """Upload a media file into the user's library. Online mode streams it to
+    Supabase Storage (<user_id>/uploads/...) and records a media_files row;
+    bypass mode keeps today's local-disk behavior."""
+    try:
+        data = await file.read()
+        return store.media_upload(
+            user.id, kind or "other",
+            file.filename or "upload", data, file.content_type or "",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Media upload failed: {str(e)}")
+
+@api.delete("/api/media/{file_id:path}")
+def delete_media(file_id: str, user=Depends(get_current_user)):
+    """Delete a media file: storage object + metadata row (bypass: local file)."""
+    try:
+        if store.media_delete(user.id, file_id):
+            return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=404, detail="Media file not found")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACCOUNT
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api.get("/api/account")
+def get_account(user=Depends(get_current_user)):
+    """{email, display_name, storage_used_bytes, storage_quota_bytes}."""
+    try:
+        return store.get_account(user.id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api.delete("/api/account")
+def delete_account(user=Depends(get_current_user)):
+    """Delete the user's data: projects, media (incl. storage objects),
+    api keys and exports. Irreversible."""
+    try:
+        store.delete_account(user.id)
+        return {"status": "deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api.patch("/api/account")
+async def update_account(request: Request, user=Depends(get_current_user)):
+    """Update profile fields (currently: display_name)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    name = (body.get("display_name") or "").strip()[:80]
+    try:
+        return store.update_account(user.id, name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VOICE OVER UPLOAD
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/upload/voiceover")
+@api.post("/api/upload/voiceover")
 async def upload_voiceover(file: UploadFile = File(...)):
     """Upload an MP3 voice-over file directly into the Voice Over folder."""
     target_dir = "Media Library/Voice Over"
@@ -773,7 +761,7 @@ async def upload_voiceover(file: UploadFile = File(...)):
 # TRANSCRIPTION (Faster-Whisper)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/api/transcribe")
+@api.post("/api/transcribe")
 async def transcribe_file(file: UploadFile = File(...)):
     target_dir = "Media Library/Transcribed Files"
     os.makedirs(target_dir, exist_ok=True)
@@ -800,7 +788,7 @@ async def transcribe_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 
-@app.post("/api/transcribe/download")
+@api.post("/api/transcribe/download")
 async def download_transcript(
     segments_json: str = Form(...),
     full_text: str = Form(""),
@@ -846,7 +834,7 @@ class SaveDownloadRequest(BaseModel):
     folder: str
     filename: str = ""
 
-@app.post("/api/save-download")
+@api.post("/api/save-download")
 def save_download_asset(req: SaveDownloadRequest):
     folder_map = {
         "Downloaded Clips": "Media Library/Downloaded Clips",
@@ -869,92 +857,6 @@ def save_download_asset(req: SaveDownloadRequest):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMART UPLOAD — auto-routes to correct folder, no duplicates
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/upload/smart")
-async def smart_upload(file: UploadFile = File(...)):
-    fname = (file.filename or "upload").replace(" ", "_")
-    ext = os.path.splitext(fname)[1].lower()
-    video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
-    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-    audio_exts = {".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"}
-    if ext in video_exts:
-        target_dir, file_type = "Media Library/Stock Videos", "video"
-    elif ext in image_exts:
-        target_dir, file_type = "Media Library/Images", "image"
-    elif ext in audio_exts:
-        target_dir, file_type = "Media Library/Background Music", "audio"
-    else:
-        target_dir, file_type = "Media Library/Stock Videos", "video"
-    os.makedirs(target_dir, exist_ok=True)
-    file_path = os.path.join(target_dir, os.path.basename(fname))
-    if not os.path.exists(file_path):
-        with open(file_path, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
-    return {
-        "status": "success",
-        "filename": os.path.basename(fname),
-        "saved_path": file_path.replace("\\", "/"),
-        "file_type": file_type,
-        "folder": target_dir
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# API KEYS — get & save
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ApiKeysBody(BaseModel):
-    keys: Dict[str, str]
-
-@app.get("/api/api-keys")
-def get_api_keys():
-    return _load_api_keys()
-
-@app.post("/api/api-keys")
-def save_api_keys(body: ApiKeysBody):
-    _save_api_keys(body.keys)
-    # Reload into ai_service runtime
-    keys = body.keys
-    if keys.get("gemini"):
-        ai_service.GEMINI_API_KEY = keys["gemini"]
-    if keys.get("groq"):
-        ai_service.GROQ_API_KEY = keys["groq"]
-    if keys.get("pexels"):
-        ai_service.PEXELS_API_KEY = keys["pexels"]
-    return {"status": "saved"}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SCRIPT GENERATOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ScriptRequest(BaseModel):
-    topic: str
-    platform: str = "YouTube"
-    duration: str = "60"
-    tone: str = "professional"
-    provider: str = "gemini"
-
-@app.post("/api/generate-script")
-async def generate_script(req: ScriptRequest):
-    keys = _load_api_keys()
-    try:
-        result = await ai_service.generate_script(
-            topic=req.topic,
-            platform=req.platform,
-            duration=req.duration,
-            tone=req.tone,
-            provider=req.provider,
-            api_keys=keys,
-        )
-        return {"script": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # VOICE OVER — list voices & generate TTS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -964,9 +866,9 @@ class VoiceOverRequest(BaseModel):
     speed: float = 1.0
     pitch: int = 0
 
-@app.post("/api/generate-voiceover")
-async def generate_voiceover(req: VoiceOverRequest):
-    keys = _load_api_keys()
+@api.post("/api/generate-voiceover")
+async def generate_voiceover(req: VoiceOverRequest, user=Depends(get_current_user)):
+    keys = store.get_all_api_keys(user.id)
     try:
         out_path = await ai_service.generate_voiceover(
             text=req.text,
@@ -990,9 +892,9 @@ class ChatRequest(BaseModel):
     provider: str = "gemini"
     system_prompt: str = "You are a professional AI video director helping plan and edit videos."
 
-@app.post("/api/chat")
-async def ai_chat(req: ChatRequest):
-    keys = _load_api_keys()
+@api.post("/api/chat")
+async def ai_chat(req: ChatRequest, user=Depends(get_current_user)):
+    keys = store.get_all_api_keys(user.id)
     try:
         reply = await ai_service.ai_chat(
             message=req.message,
@@ -1010,19 +912,19 @@ async def ai_chat(req: ChatRequest):
 # ASSETS SEARCH — Pexels videos & photos
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/search-assets")
+@api.get("/api/search-assets")
 async def search_assets(
     query: str = Query(...),
     type: str = Query("video"),
     page: int = Query(1),
     per_page: int = Query(20),
+    user=Depends(get_current_user),
 ):
-    keys = _load_api_keys()
-    pexels_key = keys.get("pexels", "")
+    pexels_key = store.get_api_key(user.id, "pexels")
     if not pexels_key:
         raise HTTPException(status_code=400, detail="Pexels API key not configured. Add it in API Keys panel.")
     try:
-        results = await ai_service.search_pexels(
+        results = await ai_service.search_pexels_async(
             query=query,
             media_type=type,
             page=page,
@@ -1038,14 +940,14 @@ async def search_assets(
 # SFX SEARCH — Freesound
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.get("/api/search-sfx")
+@api.get("/api/search-sfx")
 async def search_sfx(
     query: str = Query(...),
     page: int = Query(1),
     per_page: int = Query(20),
+    user=Depends(get_current_user),
 ):
-    keys = _load_api_keys()
-    freesound_key = keys.get("freesound", "")
+    freesound_key = store.get_api_key(user.id, "freesound")
     try:
         results = await ai_service.search_freesound(
             query=query,
@@ -1056,3 +958,7 @@ async def search_sfx(
         return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Mount all /api routes (auth-gated) on the app. Must stay last: routes
+# registered on `api` after this line would not be included.
+app.include_router(api)

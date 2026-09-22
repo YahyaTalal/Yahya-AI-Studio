@@ -1,8 +1,19 @@
-import whisper
 import os
-import torch
+
+# NOTE (live deploy): whisper + torch are imported lazily inside get_model()
+# so the server starts fast and light. They are only needed for transcription.
 
 _model = None
+
+def _load_whisper():
+    try:
+        import whisper
+    except ImportError as e:
+        raise RuntimeError(
+            "Whisper is not installed in this environment. "
+            "Transcription is disabled."
+        ) from e
+    return whisper
 
 def get_model(model_name="tiny"):
     """
@@ -11,6 +22,7 @@ def get_model(model_name="tiny"):
     """
     global _model
     if _model is None:
+        whisper = _load_whisper()
         print(f"Loading Whisper model '{model_name}' on CPU...")
         # Force CPU device for 6GB RAM/low-end systems
         _model = whisper.load_model(model_name, device="cpu")

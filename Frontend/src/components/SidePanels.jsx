@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { apiFetch, listMedia, uploadMedia, deleteMedia } from '../api';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API Keys Panel
@@ -48,7 +49,7 @@ export function APIKeysPanel() {
 
   useEffect(() => {
     // Load masked keys on mount
-    fetch('/api/api-keys')
+    apiFetch('/api/api-keys')
       .then(r => r.json())
       .then(d => setKeys(d.keys || {}))
       .catch(() => {});
@@ -62,7 +63,7 @@ export function APIKeysPanel() {
       const fd = new FormData();
       fd.append('provider', provider);
       fd.append('key', val);
-      await fetch('/api/api-keys', { method: 'POST', body: fd });
+      await apiFetch('/api/api-keys', { method: 'POST', body: fd });
       setKeys(k => ({ ...k, [provider]: val.slice(0, 8) + '*'.repeat(Math.max(0, val.length - 8)) }));
       setInputs(i => ({ ...i, [provider]: '' }));
     } finally {
@@ -72,7 +73,7 @@ export function APIKeysPanel() {
 
   const handleDelete = async (provider) => {
     if (!confirm(`Delete ${provider} API key?`)) return;
-    await fetch(`/api/api-keys/${provider}`, { method: 'DELETE' });
+    await apiFetch(`/api/api-keys/${provider}`, { method: 'DELETE' });
     setKeys(k => { const n = { ...k }; delete n[provider]; return n; });
     setTestResult(t => { const n = { ...t }; delete n[provider]; return n; });
   };
@@ -82,7 +83,7 @@ export function APIKeysPanel() {
       setRevealed(r => ({ ...r, [provider]: null }));
       return;
     }
-    const r = await fetch(`/api/api-keys/reveal/${provider}`).then(x => x.json());
+    const r = await apiFetch(`/api/api-keys/reveal/${provider}`).then(x => x.json());
     setRevealed(rv => ({ ...rv, [provider]: r.key }));
   };
 
@@ -92,7 +93,7 @@ export function APIKeysPanel() {
     try {
       const fd = new FormData();
       fd.append('provider', provider);
-      const res = await fetch('/api/api-keys/test', { method: 'POST', body: fd });
+      const res = await apiFetch('/api/api-keys/test', { method: 'POST', body: fd });
       const d = await res.json();
       setTestResult(t => ({ ...t, [provider]: d.valid ? 'valid' : `invalid: ${d.error || ''}` }));
     } catch (e) {
@@ -249,7 +250,7 @@ export function ScriptPanel({ onScriptGenerated }) {
     const finalStyle = style === 'Custom Style...' ? (customStyle.trim() || 'Custom') : style;
     setError(''); setLoading(true); setScript(null);
     try {
-      const res = await fetch('/api/generate-script', {
+      const res = await apiFetch('/api/generate-script', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, description: desc, style: finalStyle, provider })
@@ -422,43 +423,53 @@ export function ScriptPanel({ onScriptGenerated }) {
 // Voice Over Panel
 // ─────────────────────────────────────────────────────────────────────────────
 export function VoiceOverPanel({ onFileUploaded }) {
+  // Voice-over files are now user-scoped media (kind 'audio') via /api/media.
   const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [previewId, setPreviewId] = useState(null);
   const [error, setError] = useState('');
   const audioRef = useRef(null);
   const dropRef = useRef(null);
+  const fileInputRef = useRef(null);
 
-  const loadFiles = () => {
-    fetch('/api/folder-scan?path=' + encodeURIComponent('Media Library/Voice Over') + '&types=mp3,wav')
-      .then(r => r.json())
-      .then(d => setFiles(d.files || []))
-      .catch(() => {});
+  const loadFiles = async () => {
+    try {
+      const data = await listMedia();
+      const all = Array.isArray(data) ? data : (data.files || []);
+      setFiles(all.filter((f) => (f.kind || '').toLowerCase() === 'audio'));
+    } catch {
+      setFiles([]);
+    }
   };
 
   useEffect(() => { loadFiles(); }, []);
 
   const handleUpload = async (file) => {
     if (!file) return;
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (ext !== 'mp3' && ext !== 'wav') {
-      setError('Invalid file format. Only MP3 and WAV are supported for Voice Over.');
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (!['mp3', 'wav', 'ogg', 'aac', 'm4a', 'flac'].includes(ext)) {
+      setError('Invalid file format. Only audio files are supported for Voice Over.');
       return;
     }
     setError('');
     setUploading(true);
-    const fd = new FormData();
-    fd.append('file', file);
     try {
-      const res = await fetch('/api/upload/voiceover', { method: 'POST', body: fd });
-      const data = await res.json();
-      if (data.status === 'success') {
-        loadFiles();
-        if (onFileUploaded) onFileUploaded(data);
-      }
+      const data = await uploadMedia(file, 'audio');
+      await loadFiles();
+      if (onFileUploaded) onFileUploaded({ path: data.signed_url || data.path, filename: data.filename });
     } catch (err) {
       setError('Upload failed. Please check connection or file size.');
     } finally { setUploading(false); }
+  };
+
+  const handleDelete = async (f) => {
+    if (!confirm(`Delete "${f.filename}" from your library?`)) return;
+    try {
+      await deleteMedia(f.id);
+      setFiles((fs) => fs.filter((x) => x.id !== f.id));
+    } catch (e) {
+      setError('Delete failed. Please try again.');
+    }
   };
 
   const handleDrop = (e) => {
@@ -468,14 +479,14 @@ export function VoiceOverPanel({ onFileUploaded }) {
   };
 
   const togglePreview = (file) => {
-    if (previewId === file.path) {
+    if (previewId === file.id) {
       audioRef.current?.pause();
       setPreviewId(null);
     } else {
       if (audioRef.current) audioRef.current.pause();
-      audioRef.current = new Audio(encodeURI('/' + file.path.replace(/\\/g, '/')));
+      audioRef.current = new Audio(file.signed_url);
       audioRef.current.play().catch(() => {});
-      setPreviewId(file.path);
+      setPreviewId(file.id);
       audioRef.current.onended = () => setPreviewId(null);
     }
   };
@@ -487,14 +498,15 @@ export function VoiceOverPanel({ onFileUploaded }) {
         className={`vo-dropzone ${uploading ? 'uploading' : ''}`}
         onDrop={handleDrop}
         onDragOver={e => e.preventDefault()}
-        onClick={() => {
-          const inp = document.createElement('input');
-          inp.type = 'file';
-          inp.accept = '.mp3,.wav';
-          inp.onchange = e => handleUpload(e.target.files[0]);
-          inp.click();
-        }}
+        onClick={() => fileInputRef.current?.click()}
       >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".mp3,.wav,.ogg,.aac,.m4a,.flac"
+          style={{ display: 'none' }}
+          onChange={(e) => { const f = e.target.files[0]; e.target.value = ''; handleUpload(f); }}
+        />
         {uploading ? (
           <div className="vo-spinner-wrapper">
             <div className="premium-loading-circle" />
@@ -509,8 +521,8 @@ export function VoiceOverPanel({ onFileUploaded }) {
                 <line x1="12" y1="19" x2="12" y2="22" />
               </svg>
             </div>
-            <span className="vo-drop-text">Drop MP3/WAV or click to browse</span>
-            <span className="vo-drop-hint">Saved to: Media Library / Voice Over</span>
+            <span className="vo-drop-text">Drop audio or click to browse</span>
+            <span className="vo-drop-hint">Saved to your media library</span>
           </>
         )}
       </div>
@@ -529,10 +541,10 @@ export function VoiceOverPanel({ onFileUploaded }) {
       {files.length > 0 && (
         <div className="vo-files-list">
           <div className="vo-files-header">Voice Over Files ({files.length})</div>
-          {files.map((f, i) => (
-            <div key={i} className="vo-file-row">
+          {files.map((f) => (
+            <div key={f.id} className="vo-file-row">
               <button className="vo-play-btn" onClick={() => togglePreview(f)}>
-                {previewId === f.path ? (
+                {previewId === f.id ? (
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
                     <rect x="4" y="4" width="16" height="16" />
                   </svg>
@@ -543,9 +555,15 @@ export function VoiceOverPanel({ onFileUploaded }) {
                 )}
               </button>
               <div className="vo-file-info">
-                <span className="vo-file-name" title={f.name}>{f.name}</span>
-                <span className="vo-file-size">{(f.size / 1024 / 1024).toFixed(1)} MB</span>
+                <span className="vo-file-name" title={f.filename}>{f.filename}</span>
+                <span className="vo-file-size">{fmtMediaSize(f.size_bytes)}</span>
               </div>
+              <button className="vo-del-btn" onClick={() => handleDelete(f)} title="Delete from library">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                </svg>
+              </button>
             </div>
           ))}
         </div>
@@ -553,6 +571,9 @@ export function VoiceOverPanel({ onFileUploaded }) {
     </div>
   );
 }
+
+
+
 
 
 export function TranscribePanel({ addAssetToTimeline, onSendToAI }) {
@@ -584,7 +605,7 @@ export function TranscribePanel({ addAssetToTimeline, onSendToAI }) {
     try {
       const fd = new FormData();
       fd.append('file', file);
-      const res = await fetch('/api/transcribe', { method: 'POST', body: fd });
+      const res = await apiFetch('/api/transcribe', { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Transcription failed');
       setResult(data);
@@ -605,7 +626,7 @@ export function TranscribePanel({ addAssetToTimeline, onSendToAI }) {
     fd.append('full_text', result.full_text || '');
     fd.append('format', format);
     fd.append('filename', (file?.name || 'transcript').replace(/\.[^.]+$/, ''));
-    const res = await fetch('/api/transcribe/download', { method: 'POST', body: fd });
+    const res = await apiFetch('/api/transcribe/download', { method: 'POST', body: fd });
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -788,7 +809,7 @@ export function AIChatPanel({ scriptData, project, addAssetToTimeline, pushHisto
         logs.push(`[Pexels] Searching "${act.query}"...`);
         setActionLog(l => [...l, `[Pexels] Searching Pexels: "${act.query}"…`]);
         try {
-          const res = await fetch(`/api/search/pexels?query=${encodeURIComponent(act.query)}&media_type=${act.type || 'videos'}&per_page=${act.count || 3}`);
+          const res = await apiFetch(`/api/search/pexels?query=${encodeURIComponent(act.query)}&media_type=${act.type || 'videos'}&per_page=${act.count || 3}`);
           const data = await res.json();
           if (data.results?.[0]) {
             const item = data.results[0];
@@ -804,7 +825,7 @@ export function AIChatPanel({ scriptData, project, addAssetToTimeline, pushHisto
       } else if (act.action === 'search_pixabay') {
         setActionLog(l => [...l, `[Pixabay] Searching "${act.query}" (${act.type})…`]);
         try {
-          const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(act.query)}&media_type=${act.type || 'film'}&per_page=${act.count || 3}`);
+          const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(act.query)}&media_type=${act.type || 'film'}&per_page=${act.count || 3}`);
           const data = await res.json();
           if (data.results?.[0]) {
             const item = data.results[0];
@@ -828,7 +849,7 @@ export function AIChatPanel({ scriptData, project, addAssetToTimeline, pushHisto
     setSending(true);
     try {
       const scriptCtx = scriptData ? `Script: ${scriptData.title} (${scriptData.scenes?.length || 0} scenes)` : '';
-      const res = await fetch('/api/ai-chat', {
+      const res = await apiFetch('/api/ai-chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1068,7 +1089,7 @@ export function ArrangerPanel({ scriptData, project, setProject, pushHistory, uu
       addStep(`Scene ${scene.scene}: Searching Pexels "${scene.stock_query_pexels}"...`);
       // Search Pexels for video
       try {
-        const res = await fetch(`/api/search/pexels?query=${encodeURIComponent(scene.stock_query_pexels || scene.script.slice(0, 30))}&media_type=videos&per_page=1`);
+        const res = await apiFetch(`/api/search/pexels?query=${encodeURIComponent(scene.stock_query_pexels || scene.script.slice(0, 30))}&media_type=videos&per_page=1`);
         const data = await res.json();
         if (data.results?.[0]) {
           const vid = data.results[0];
@@ -1102,7 +1123,7 @@ export function ArrangerPanel({ scriptData, project, setProject, pushHistory, uu
       if (scene.sfx) {
         addStep(`Scene ${scene.scene}: Searching SFX "${scene.sfx}"...`);
         try {
-          const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(scene.sfx)}&media_type=sound&per_page=1`);
+          const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(scene.sfx)}&media_type=sound&per_page=1`);
           const data = await res.json();
           if (data.results?.[0]) {
             const sfx = data.results[0];
@@ -1122,7 +1143,7 @@ export function ArrangerPanel({ scriptData, project, setProject, pushHistory, uu
       if (scene.background_music && newTracks.audio2.filter(c => c.filename?.includes('music')).length === 0) {
         addStep(`Scene 1: Searching background music...`);
         try {
-          const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(scene.background_music)}&media_type=music&per_page=1`);
+          const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(scene.background_music)}&media_type=music&per_page=1`);
           const data = await res.json();
           if (data.results?.[0]) {
             const mus = data.results[0];
@@ -1275,52 +1296,341 @@ export function ArrangerPanel({ scriptData, project, setProject, pushHistory, uu
 // ─────────────────────────────────────────────────────────────────────────────
 // Assets Panel
 // ─────────────────────────────────────────────────────────────────────────────
-export function AssetsPanel({ addAssetToTimeline, library }) {
-  const [search, setSearch] = useState('');
-  const [expandedFolder, setExpandedFolder] = useState(null);
-  const [folderFiles, setFolderFiles] = useState({});
-  const [loading, setLoading] = useState({});
 
-  const FOLDERS = [
-    { name: 'Avatar Videos', types: 'mp4,mov,avi,webm', trackType: 'video' },
-    { name: 'Background Music', types: 'mp3,wav,ogg,aac', trackType: 'music' },
-    { name: 'Downloaded Audios', types: 'mp3,wav,ogg', trackType: 'music' },
-    { name: 'Downloaded Clips', types: 'mp4,mov,avi,webm', trackType: 'video' },
-    { name: 'Downloaded Images', types: 'jpg,jpeg,png,webp,gif', trackType: 'image' },
-    { name: 'Images', types: 'jpg,jpeg,png,webp,gif,bmp', trackType: 'image' },
-    { name: 'Sound Effects SFX', types: 'mp3,wav', trackType: 'music' },
-    { name: 'Stock Videos', types: 'mp4,mov,avi,webm', trackType: 'video' },
-    { name: 'Templates', types: 'json', trackType: null },
-    { name: 'Transcribed Files', types: 'mp3,wav,mp4,mov', trackType: null },
-    { name: 'Voice Over', types: 'mp3,wav', trackType: 'voiceover' }
-  ];
+// ─────────────────────────────────────────────────────────────────────────────
+// MediaLibrarySection — user-scoped media library backed by the new /api/media
+// endpoints (replaces the old local-folder scanning):
+//   GET  /api/media          → [{ id, filename, kind, size_bytes, signed_url }]
+//   POST /api/media/upload   → multipart (file, kind)
+//   DELETE /api/media/{id}
+// The signed_url is used opaquely: in Supabase mode it is a signed Storage URL,
+// in local bypass mode the backend returns a local /api/serve-media URL.
+// kind is 'video' | 'image' | 'audio'; layout 'audio' renders rows, the other
+// two render the existing media-grid cards.
+// ─────────────────────────────────────────────────────────────────────────────
+const fmtMediaSize = (b) => {
+  if (!b || b <= 0) return '';
+  return b > 1024 * 1024
+    ? `${(b / 1024 / 1024).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(b / 1024))} KB`;
+};
 
-  const loadFolder = async (folderName, types) => {
-    setLoading(l => ({ ...l, [folderName]: true }));
+export function MediaLibrarySection({ kind, accept, layout, addAssetToTimeline, trackType, refreshKey }) {
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [previewId, setPreviewId] = useState(null);
+  const [error, setError] = useState('');
+  const audioRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  const load = async () => {
+    setLoading(true);
+    setError('');
     try {
-      const path = encodeURIComponent(`Media Library/${folderName}`);
-      const res = await fetch(`/api/folder-scan?path=${path}&types=${types}`);
-      const data = await res.json();
-      setFolderFiles(f => ({ ...f, [folderName]: data.files || [] }));
-    } catch { setFolderFiles(f => ({ ...f, [folderName]: [] })); }
-    finally { setLoading(l => ({ ...l, [folderName]: false })); }
-  };
-
-  const toggleFolder = (folder) => {
-    if (expandedFolder === folder.name) {
-      setExpandedFolder(null);
-    } else {
-      setExpandedFolder(folder.name);
-      if (!folderFiles[folder.name]) loadFolder(folder.name, folder.types);
+      const data = await listMedia();
+      const all = Array.isArray(data) ? data : (data.files || []);
+      setFiles(all.filter((f) => (f.kind || '').toLowerCase() === kind));
+    } catch (e) {
+      setFiles([]);
+      setError('Could not load your media library.');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const isAudio = (f) => /\.(mp3|wav|ogg|aac|flac)$/i.test(f.name);
-  const isImage = (f) => /\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(f.name);
-  const isVideo = (f) => /\.(mp4|mov|avi|webm|mkv)$/i.test(f.name);
+  useEffect(() => { load(); }, [refreshKey]);
 
-  const allFiles = FOLDERS.flatMap(folder => (folderFiles[folder.name] || []).map(f => ({ ...f, folder: folder.name, trackType: folder.trackType })));
-  const filtered = search ? allFiles.filter(f => f.name.toLowerCase().includes(search.toLowerCase())) : [];
+  const handleUpload = async (file) => {
+    if (!file) return;
+    setUploading(true);
+    setError('');
+    try {
+      await uploadMedia(file, kind);
+      await load();
+    } catch (e) {
+      setError('Upload failed: ' + (e.message || 'please try again.'));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleDelete = async (f) => {
+    if (!confirm(`Delete "${f.filename}" from your library?`)) return;
+    try {
+      await deleteMedia(f.id);
+      setFiles((fs) => fs.filter((x) => x.id !== f.id));
+    } catch (e) {
+      setError('Delete failed: ' + (e.message || 'please try again.'));
+    }
+  };
+
+  const togglePreview = (f) => {
+    if (previewId === f.id) {
+      audioRef.current?.pause();
+      setPreviewId(null);
+    } else {
+      if (audioRef.current) audioRef.current.pause();
+      audioRef.current = new Audio(f.signed_url);
+      audioRef.current.play().catch(() => {});
+      setPreviewId(f.id);
+      audioRef.current.onended = () => setPreviewId(null);
+    }
+  };
+
+  const addToTimeline = (f) => {
+    addAssetToTimeline({ filename: f.filename, path: f.signed_url }, trackType);
+  };
+
+  const kindLabel = kind === 'audio' ? 'audio files' : kind === 'video' ? 'videos' : 'images';
+
+  return (
+    <div className="vp-local-section">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={accept}
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const chosen = Array.from(e.target.files || []);
+          e.target.value = '';
+          chosen.forEach((f) => handleUpload(f));
+        }}
+      />
+      <button
+        className={`vp-folder-btn ${uploading ? 'loading' : ''}`}
+        onClick={() => fileInputRef.current?.click()}
+        disabled={uploading}
+        title="Upload files to your media library"
+      >
+        <div className="vp-folder-btn-icon">
+          {uploading ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="vp-spin">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+            </svg>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+          )}
+        </div>
+        <div className="vp-folder-btn-text">
+          <span className="vp-folder-btn-label">
+            {uploading ? 'Uploading...' : 'Upload Files'}
+          </span>
+          <span className="vp-folder-btn-sub">
+            {files.length} {kindLabel} in your library
+          </span>
+        </div>
+        <div className="vp-folder-btn-arrow">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="9 18 15 12 9 6" />
+          </svg>
+        </div>
+      </button>
+
+      {error && (
+        <div className="premium-error-banner">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="12" />
+            <line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          {error}
+        </div>
+      )}
+
+      {layout === 'audio' && (
+        <div className="sfx-files-list">
+          {loading && (
+            <div className="vp-loading">
+              <div className="vp-loading-spinner" />
+              <span>Loading your audio...</span>
+            </div>
+          )}
+          {!loading && files.length === 0 && (
+            <div className="vp-empty">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
+                <path d="M9 18V5l12-2v13" />
+                <circle cx="6" cy="18" r="3" />
+                <circle cx="18" cy="16" r="3" />
+              </svg>
+              <span>No audio files yet.<br/>Upload some above.</span>
+            </div>
+          )}
+          {files.map((f) => (
+            <div key={f.id} className="sfx-file-row">
+              <button className="sfx-play-btn" onClick={() => togglePreview(f)}>
+                {previewId === f.id ? (
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="4" y="4" width="4" height="16" />
+                    <rect x="16" y="4" width="4" height="16" />
+                  </svg>
+                ) : (
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: '1px' }}>
+                    <polygon points="5 3 19 12 5 21" />
+                  </svg>
+                )}
+              </button>
+              <div className="sfx-result-info">
+                <span className="sfx-file-name" title={f.filename}>{f.filename}</span>
+                <AudioDuration path={f.signed_url} />
+              </div>
+              <span className="sfx-result-source" style={{ opacity: 0.5, fontSize: '10px' }}>{fmtMediaSize(f.size_bytes)}</span>
+              <button className="sfx-add-btn" onClick={() => addToTimeline(f)} title="Add to Timeline">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </button>
+              <button className="sfx-add-btn media-row-del" onClick={() => handleDelete(f)} title="Delete from library">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                </svg>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {(layout === 'video' || layout === 'image') && (
+        <div className="media-grid">
+          {loading && (
+            <div className="vp-loading">
+              <div className="vp-loading-spinner" />
+              <span>Loading your {kindLabel}...</span>
+            </div>
+          )}
+          {!loading && files.length === 0 && (
+            <div className="vp-empty">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
+                <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" />
+                <line x1="7" y1="2" x2="7" y2="22" /><line x1="17" y1="2" x2="17" y2="22" />
+                <line x1="2" y1="12" x2="22" y2="12" />
+              </svg>
+              <span>No {kindLabel} yet.<br/>Upload some above.</span>
+            </div>
+          )}
+          {files.map((f) => (
+            <div
+              key={f.id}
+              className="media-card"
+              onClick={() => addToTimeline(f)}
+              title={f.filename}
+            >
+              {layout === 'video' ? (
+                <video
+                  src={f.signed_url + '#t=1'}
+                  muted
+                  preload="metadata"
+                  playsInline
+                  style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#000' }}
+                  onMouseEnter={(e) => { e.currentTarget.src = f.signed_url; e.currentTarget.play().catch(() => {}); }}
+                  onMouseLeave={(e) => { e.currentTarget.pause(); e.currentTarget.src = f.signed_url + '#t=1'; }}
+                />
+              ) : (
+                <img src={f.signed_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+              )}
+              <div className="vp-card-overlay">
+                <div className="vp-play-icon" style={layout === 'image' ? { background: 'rgba(0, 132, 255, 0.85)' } : undefined}>
+                  {layout === 'video' ? (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="white" stroke="none">
+                      <polygon points="5 3 19 12 5 21 5 3" />
+                    </svg>
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  )}
+                </div>
+              </div>
+              <button className="media-del-btn" onClick={(e) => { e.stopPropagation(); handleDelete(f); }} title="Delete from library">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                </svg>
+              </button>
+              <div className="media-card-label" style={{ fontSize: '8.5px' }}>{f.filename}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+export function AssetsPanel({ addAssetToTimeline }) {
+  // Unified user-scoped media library: one GET /api/media call, grouped by kind.
+  const [search, setSearch] = useState('');
+  const [media, setMedia] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState('');
+  const fileInputRef = useRef(null);
+
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await listMedia();
+      setMedia(Array.isArray(data) ? data : (data.files || []));
+    } catch (e) {
+      setMedia([]);
+      setError('Could not load your media library.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const guessKind = (file) => {
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (['mp4', 'mov', 'avi', 'webm', 'mkv'].includes(ext)) return 'video';
+    if (['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].includes(ext)) return 'image';
+    if (['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a'].includes(ext)) return 'audio';
+    return null;
+  };
+
+  const handleUpload = async (file) => {
+    if (!file) return;
+    const kind = guessKind(file);
+    if (!kind) { setError(`Unsupported file type: ${file.name}`); return; }
+    setUploading(true);
+    setError('');
+    try {
+      await uploadMedia(file, kind);
+      await load();
+    } catch (e) {
+      setError('Upload failed: ' + (e.message || 'please try again.'));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleDelete = async (f) => {
+    if (!confirm(`Delete "${f.filename}" from your library?`)) return;
+    try {
+      await deleteMedia(f.id);
+      setMedia((ms) => ms.filter((x) => x.id !== f.id));
+    } catch (e) {
+      setError('Delete failed: ' + (e.message || 'please try again.'));
+    }
+  };
+
+  const kindOf = (f) => (f.kind || '').toLowerCase();
+  const trackTypeOf = (f) => (kindOf(f) === 'video' ? 'video' : kindOf(f) === 'image' ? 'image' : 'music');
+  const addFile = (f) => addAssetToTimeline({ filename: f.filename, path: f.signed_url }, trackTypeOf(f));
+
+  const isAudio = (f) => /\.(mp3|wav|ogg|aac|flac|m4a)$/i.test(f.filename || '');
+  const isImage = (f) => /\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(f.filename || '');
+  const isVideo = (f) => /\.(mp4|mov|avi|webm|mkv)$/i.test(f.filename || '');
 
   const getFileIcon = (f) => {
     if (isVideo(f)) {
@@ -1359,9 +1669,96 @@ export function AssetsPanel({ addAssetToTimeline, library }) {
     );
   };
 
+  const GROUPS = [
+    { key: 'video', label: 'Videos' },
+    { key: 'image', label: 'Images' },
+    { key: 'audio', label: 'Audio' },
+  ];
+
+  const q = search.trim().toLowerCase();
+  const visible = q
+    ? media.filter((f) => (f.filename || '').toLowerCase().includes(q))
+    : media;
+
+  const rowFor = (f) => {
+    const formattedSize = fmtMediaSize(f.size_bytes);
+    return (
+      <div key={f.id} className="asset-file-row" onClick={() => addFile(f)}>
+        <span className="asset-file-icon">{getFileIcon(f)}</span>
+        <span className="asset-file-name" title={f.filename}>{f.filename}</span>
+        {formattedSize && <span className="asset-file-size">{formattedSize}</span>}
+        <button className="asset-row-add-btn" title="Add to timeline" onClick={(e) => { e.stopPropagation(); addFile(f); }}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+        </button>
+        <button className="asset-row-add-btn media-row-del" title="Delete from library" onClick={(e) => { e.stopPropagation(); handleDelete(f); }}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+            <polyline points="3 6 5 6 21 6" />
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+          </svg>
+        </button>
+      </div>
+    );
+  };
+
   return (
     <div className="assets-panel">
-      <div className="assets-search-row">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="video/*,image/*,audio/*"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const chosen = Array.from(e.target.files || []);
+          e.target.value = '';
+          chosen.forEach((f) => handleUpload(f));
+        }}
+      />
+      <button
+        className={`vp-folder-btn ${uploading ? 'loading' : ''}`}
+        onClick={() => fileInputRef.current?.click()}
+        disabled={uploading}
+        title="Upload files to your media library"
+      >
+        <div className="vp-folder-btn-icon">
+          {uploading ? (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="vp-spin">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+            </svg>
+          ) : (
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+          )}
+        </div>
+        <div className="vp-folder-btn-text">
+          <span className="vp-folder-btn-label">{uploading ? 'Uploading...' : 'Upload Files'}</span>
+          <span className="vp-folder-btn-sub">{media.length} file{media.length === 1 ? '' : 's'} in your library</span>
+        </div>
+        <div className="vp-folder-btn-arrow">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="9 18 15 12 9 6" />
+          </svg>
+        </div>
+      </button>
+
+      {error && (
+        <div className="premium-error-banner">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="12" />
+            <line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          {error}
+        </div>
+      )}
+
+      <div className="assets-search-row" style={{ marginTop: '10px' }}>
         <input
           className="assets-search"
           placeholder="Search files by name..."
@@ -1370,100 +1767,31 @@ export function AssetsPanel({ addAssetToTimeline, library }) {
         />
       </div>
 
-      {search && (
-        <div className="assets-search-results">
-          <div className="assets-results-label" style={{ fontSize: '11px', color: '#64748b', fontWeight: '700', textTransform: 'uppercase', marginBottom: '8px' }}>
-            {filtered.length} results found
-          </div>
-          {filtered.length === 0 && <div className="assets-empty">No matching files found</div>}
-          {filtered.map((f, i) => (
-            <div key={i} className="asset-file-row" onClick={() => f.trackType && addAssetToTimeline({ filename: f.name, path: f.path }, f.trackType)}>
-              <span className="asset-file-icon">{getFileIcon(f)}</span>
-              <span className="asset-file-name" title={f.name}>{f.name}</span>
-              <span className="asset-file-folder">{f.folder}</span>
-              {f.trackType && (
-                <button className="asset-row-add-btn" title="Add to timeline" onClick={(e) => { e.stopPropagation(); addAssetToTimeline({ filename: f.name, path: f.path }, f.trackType); }}>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
-                </button>
-              )}
+      {loading && (
+        <div className="vp-loading" style={{ marginTop: '12px' }}>
+          <div className="vp-loading-spinner" />
+          <span>Loading your media...</span>
+        </div>
+      )}
+
+      {!loading && visible.length === 0 && (
+        <div className="vp-empty" style={{ marginTop: '12px' }}>
+          <span>{q ? 'No matching files found' : 'No media yet. Upload files above.'}</span>
+        </div>
+      )}
+
+      {!loading && GROUPS.map((g) => {
+        const items = visible.filter((f) => kindOf(f) === g.key);
+        if (items.length === 0) return null;
+        return (
+          <div key={g.key} className="assets-folder-section" style={{ marginTop: '10px' }}>
+            <div className="assets-results-label" style={{ fontSize: '11px', color: '#64748b', fontWeight: '700', textTransform: 'uppercase', marginBottom: '8px' }}>
+              {g.label} ({items.length})
             </div>
-          ))}
-        </div>
-      )}
-
-      {!search && (
-        <div className="assets-folders">
-          {FOLDERS.map(folder => {
-            const isExpanded = expandedFolder === folder.name;
-            return (
-              <div key={folder.name} className={`assets-folder-section ${isExpanded ? 'active-folder' : ''}`}>
-                <button
-                  className={`assets-folder-btn ${isExpanded ? 'expanded' : ''}`}
-                  onClick={() => toggleFolder(folder)}
-                >
-                  <span className="folder-icon-svg">
-                    {isExpanded ? (
-                      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#a855f7" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                      </svg>
-                    ) : (
-                      <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                      </svg>
-                    )}
-                  </span>
-                  <span className="folder-name">{folder.name}</span>
-                  {folderFiles[folder.name] && (
-                    <span className="folder-count">{folderFiles[folder.name].length}</span>
-                  )}
-                  <span className="folder-chevron">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="6 9 12 15 18 9" />
-                    </svg>
-                  </span>
-                </button>
-
-                {isExpanded && (
-                  <div className="assets-folder-files">
-                    {loading[folder.name] && (
-                      <div className="assets-loading">
-                        <span className="sp-spinner" style={{ display: 'inline-block', width: '12px', height: '12px', border: '2px solid rgba(168, 85, 247, 0.3)', borderTopColor: '#a855f7', borderRadius: '50%', animation: 'spin 0.8s linear infinite', marginRight: '6px', verticalAlign: 'middle' }} />
-                        Scanning folder contents...
-                      </div>
-                    )}
-                    {!loading[folder.name] && (folderFiles[folder.name] || []).length === 0 && (
-                      <div className="assets-empty">📂 No files found in this folder</div>
-                    )}
-                    {(folderFiles[folder.name] || []).map((f, i) => {
-                      const formattedSize = f.size > 1024 * 1024 
-                        ? `${(f.size / (1024 * 1024)).toFixed(1)} MB` 
-                        : `${Math.round(f.size / 1024)} KB`;
-                      return (
-                        <div key={i} className="asset-file-row" onClick={() => folder.trackType && addAssetToTimeline({ filename: f.name, path: f.path }, folder.trackType)}>
-                          <span className="asset-file-icon">{getFileIcon(f)}</span>
-                          <span className="asset-file-name" title={f.name}>{f.name}</span>
-                          {f.size > 0 && <span className="asset-file-size">{formattedSize}</span>}
-                          {folder.trackType && (
-                            <button className="asset-row-add-btn" title="Add to timeline" onClick={(e) => { e.stopPropagation(); addAssetToTimeline({ filename: f.name, path: f.path }, folder.trackType); }}>
-                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-                                <line x1="12" y1="5" x2="12" y2="19" />
-                                <line x1="5" y1="12" x2="19" y2="12" />
-                              </svg>
-                            </button>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
+            {items.map(rowFor)}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1496,17 +1824,6 @@ function AudioDuration({ path }) {
 // ─────────────────────────────────────────────────────────────────────────────
 export function SFXPanel({ addAssetToTimeline, refreshKey }) {
   const [section, setSection] = useState('local');
-  const [localFolderPath, setLocalFolderPath] = useState(() => localStorage.getItem('sfx_folder_path') || '');
-  const [folderDisplayName, setFolderDisplayName] = useState(() => localStorage.getItem('sfx_folder_display') || 'No Folder Selected');
-  const [localFiles, setLocalFiles] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem('sfx_files') || '[]');
-    } catch {
-      return [];
-    }
-  });
-  const [loadingLocal, setLoadingLocal] = useState(false);
-  const [browsingFolder, setBrowsingFolder] = useState(false);
 
   const [searchKeywords, setSearchKeywords] = useState(() => localStorage.getItem('sfx_search_keywords') || '');
   const [searchLimit, setSearchLimit] = useState(() => parseInt(localStorage.getItem('sfx_search_limit') || '5'));
@@ -1521,12 +1838,6 @@ export function SFXPanel({ addAssetToTimeline, refreshKey }) {
   const [previewId, setPreviewId] = useState(null);
   const audioRef = useRef(null);
 
-  // Scan folder if localFolderPath changes
-  useEffect(() => {
-    if (localFolderPath) {
-      scanFolder(localFolderPath);
-    }
-  }, [localFolderPath, refreshKey]);
 
   // Persist search keywords/limit/results
   useEffect(() => {
@@ -1541,42 +1852,6 @@ export function SFXPanel({ addAssetToTimeline, refreshKey }) {
     localStorage.setItem('sfx_search_limit', searchLimit.toString());
   }, [searchLimit]);
 
-  const toAudioUrl = (p) => encodeURI('/' + p.replace(/\\/g, '/'));
-
-  const scanFolder = async (folderPath) => {
-    if (!folderPath.trim()) return;
-    setLoadingLocal(true);
-    try {
-      const res = await fetch(`/api/folder-scan?path=${encodeURIComponent(folderPath)}&types=mp3,wav`);
-      const data = await res.json();
-      const files = data.files || [];
-      setLocalFiles(files);
-      localStorage.setItem('sfx_files', JSON.stringify(files));
-    } finally { setLoadingLocal(false); }
-  };
-
-  const browseLocalFolder = async () => {
-    if (browsingFolder) return;
-    setBrowsingFolder(true);
-    try {
-      const res = await fetch('/api/select-folder', { method: 'POST' });
-      const data = await res.json();
-      if (data.status === 'ok' && data.path) {
-        setLocalFolderPath(data.path);
-        const parts = data.path.replace(/\\/g, '/').split('/');
-        const displayName = parts[parts.length - 1] || data.path;
-        setFolderDisplayName(displayName);
-        localStorage.setItem('sfx_folder_path', data.path);
-        localStorage.setItem('sfx_folder_display', displayName);
-        scanFolder(data.path);
-      }
-    } catch (e) {
-      console.error('Failed to select folder', e);
-    } finally {
-      setBrowsingFolder(false);
-    }
-  };
-
   const handleSearch = async () => {
     const keywords = searchKeywords.split('\n').map(k => k.trim()).filter(Boolean);
     if (!keywords.length) return;
@@ -1584,7 +1859,7 @@ export function SFXPanel({ addAssetToTimeline, refreshKey }) {
     const all = [];
     for (const kw of keywords) {
       try {
-        const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=sound&per_page=${searchLimit}`);
+        const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=sound&per_page=${searchLimit}`);
         const data = await res.json();
         all.push(...(data.results || []).map(r => ({ ...r, keyword: kw, source: 'Pixabay' })));
       } catch {}
@@ -1625,97 +1900,16 @@ export function SFXPanel({ addAssetToTimeline, refreshKey }) {
         </button>
       </div>
 
-      {/* LOCAL TAB */}
+      {/* MY MEDIA TAB (user library) */}
       {section === 'local' && (
-        <div className="vp-local-section">
-          {/* Premium Folder Chooser */}
-          <button
-            className={`vp-folder-btn ${browsingFolder ? 'loading' : ''}`}
-            onClick={browseLocalFolder}
-            disabled={browsingFolder}
-            title="Choose folder to scan sound effects"
-          >
-            <div className="vp-folder-btn-icon">
-              {browsingFolder ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="vp-spin">
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  <line x1="12" y1="11" x2="12" y2="17" />
-                  <line x1="9" y1="14" x2="15" y2="14" />
-                </svg>
-              )}
-            </div>
-            <div className="vp-folder-btn-text">
-              <span className="vp-folder-btn-label">
-                {browsingFolder ? 'Opening...' : 'Choose Folder'}
-              </span>
-              <span className="vp-folder-btn-sub">
-                {folderDisplayName}
-              </span>
-            </div>
-            <div className="vp-folder-btn-arrow">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </div>
-          </button>
-
-          {/* Files List */}
-          <div className="sfx-files-list">
-            {loadingLocal && (
-              <div className="vp-loading">
-                <div className="vp-loading-spinner" />
-                <span>Loading sound effects...</span>
-              </div>
-            )}
-            {!loadingLocal && localFiles.length === 0 && (
-              <div className="vp-empty">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
-                  <path d="M9 18V5l12-2v13" />
-                  <circle cx="6" cy="18" r="3" />
-                  <circle cx="18" cy="16" r="3" />
-                </svg>
-                <span>No sound effects found.<br/>Choose a folder above.</span>
-              </div>
-            )}
-            {localFiles.map((f, i) => {
-              const fileUrl = toAudioUrl(f.path);
-              return (
-                <div key={i} className="sfx-file-row">
-                  <button className="sfx-play-btn" onClick={() => togglePreview(fileUrl, f.path)}>
-                    {previewId === f.path ? (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-                        <rect x="4" y="4" width="4" height="16" />
-                        <rect x="16" y="4" width="4" height="16" />
-                      </svg>
-                    ) : (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: '1px' }}>
-                        <polygon points="5 3 19 12 5 21" />
-                      </svg>
-                    )}
-                  </button>
-                  <div className="sfx-result-info">
-                    <span className="sfx-file-name" title={f.name}>{f.name}</span>
-                    <AudioDuration path={fileUrl} />
-                  </div>
-                  <button
-                    className="sfx-add-btn"
-                    onClick={() => addAssetToTimeline({ filename: f.name, path: f.path }, 'music')}
-                    title="Add to Timeline"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-                      <line x1="12" y1="5" x2="12" y2="19" />
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                    </svg>
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        <MediaLibrarySection
+          kind="audio"
+          accept=".mp3,.wav,.ogg,.aac,.m4a,.flac"
+          layout="audio"
+          addAssetToTimeline={addAssetToTimeline}
+          trackType="music"
+          refreshKey={refreshKey}
+        />
       )}
 
       {/* SEARCH TAB */}
@@ -1845,22 +2039,11 @@ export function SFXPanel({ addAssetToTimeline, refreshKey }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Video Panel — Local + Avatar + Search
 // ─────────────────────────────────────────────────────────────────────────────
-export function VideoPanel({ addAssetToTimeline, toUrlPath, refreshKey }) {
+export function VideoPanel({ addAssetToTimeline, refreshKey }) {
   const [section, setSection] = useState('local');
-  const [localFolderPath, setLocalFolderPath] = useState(() => localStorage.getItem('vp_folder_path') || '');
-  const [folderDisplayName, setFolderDisplayName] = useState(() => localStorage.getItem('vp_folder_display') || 'No Folder Selected');
-  const [localFiles, setLocalFiles] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem('vp_files') || '[]');
-    } catch {
-      return [];
-    }
-  });
-  const [loadingLocal, setLoadingLocal] = useState(false);
   const [searchKeywords, setSearchKeywords] = useState('');
   const [searching, setSearching] = useState(false);
   const [searchResults, setSearchResults] = useState([]);
-  const [browsingFolder, setBrowsingFolder] = useState(false);
 
   // Search options
   const [sources, setSources] = useState({ pexels: true, pixabay: true });
@@ -1869,46 +2052,6 @@ export function VideoPanel({ addAssetToTimeline, toUrlPath, refreshKey }) {
   // Avatar state
   const [avatarFile, setAvatarFile] = useState(null);
 
-  // Scan folder if localFolderPath changes
-  useEffect(() => {
-    if (localFolderPath) {
-      scanFolder(localFolderPath);
-    }
-  }, [localFolderPath, refreshKey]);
-
-  const scanFolder = async (folderPath) => {
-    if (!folderPath.trim()) return;
-    setLoadingLocal(true);
-    try {
-      const res = await fetch(`/api/folder-scan?path=${encodeURIComponent(folderPath)}&types=mp4`);
-      const data = await res.json();
-      const files = data.files || [];
-      setLocalFiles(files);
-      localStorage.setItem('vp_files', JSON.stringify(files));
-    } finally { setLoadingLocal(false); }
-  };
-
-  const browseLocalFolder = async () => {
-    if (browsingFolder) return;
-    setBrowsingFolder(true);
-    try {
-      const res = await fetch('/api/select-folder', { method: 'POST' });
-      const data = await res.json();
-      if (data.status === 'ok' && data.path) {
-        setLocalFolderPath(data.path);
-        const parts = data.path.replace(/\\/g, '/').split('/');
-        const displayName = parts[parts.length - 1] || data.path;
-        setFolderDisplayName(displayName);
-        localStorage.setItem('vp_folder_path', data.path);
-        localStorage.setItem('vp_folder_display', displayName);
-        scanFolder(data.path);
-      }
-    } catch (e) {
-      console.error('Failed to select folder', e);
-    } finally {
-      setBrowsingFolder(false);
-    }
-  };
 
   const handleAvatarSelect = (e) => {
     const f = e.target.files[0];
@@ -1927,14 +2070,14 @@ export function VideoPanel({ addAssetToTimeline, toUrlPath, refreshKey }) {
     for (const kw of keywords) {
       if (sources.pexels) {
         try {
-          const res = await fetch(`/api/search/pexels?query=${encodeURIComponent(kw)}&media_type=videos&per_page=${searchLimit}`);
+          const res = await apiFetch(`/api/search/pexels?query=${encodeURIComponent(kw)}&media_type=videos&per_page=${searchLimit}`);
           const data = await res.json();
           all.push(...(data.results || []).map(r => ({ ...r, keyword: kw, source: 'Pexels' })));
         } catch {}
       }
       if (sources.pixabay) {
         try {
-          const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=film&per_page=${searchLimit}`);
+          const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=film&per_page=${searchLimit}`);
           const data = await res.json();
           all.push(...(data.results || []).map(r => ({ ...r, keyword: kw, source: 'Pixabay' })));
         } catch {}
@@ -1970,89 +2113,16 @@ export function VideoPanel({ addAssetToTimeline, toUrlPath, refreshKey }) {
         </button>
       </div>
 
-      {/* LOCAL TAB */}
+      {/* MY MEDIA TAB (user library) */}
       {section === 'local' && (
-        <div className="vp-local-section">
-          {/* Premium Folder Chooser */}
-          <button
-            className={`vp-folder-btn ${browsingFolder ? 'loading' : ''}`}
-            onClick={browseLocalFolder}
-            disabled={browsingFolder}
-            title="Choose a folder to load MP4 videos"
-          >
-            <div className="vp-folder-btn-icon">
-              {browsingFolder ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="vp-spin">
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  <line x1="12" y1="11" x2="12" y2="17" />
-                  <line x1="9" y1="14" x2="15" y2="14" />
-                </svg>
-              )}
-            </div>
-            <div className="vp-folder-btn-text">
-              <span className="vp-folder-btn-label">
-                {browsingFolder ? 'Opening...' : 'Choose Folder'}
-              </span>
-              <span className="vp-folder-btn-sub">
-                {folderDisplayName}
-              </span>
-            </div>
-            <div className="vp-folder-btn-arrow">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </div>
-          </button>
-
-          {/* Video Grid */}
-          <div className="media-grid">
-            {loadingLocal && (
-              <div className="vp-loading">
-                <div className="vp-loading-spinner" />
-                <span>Loading videos...</span>
-              </div>
-            )}
-            {!loadingLocal && localFiles.length === 0 && (
-              <div className="vp-empty">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
-                  <rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18" />
-                  <line x1="7" y1="2" x2="7" y2="22" /><line x1="17" y1="2" x2="17" y2="22" />
-                  <line x1="2" y1="12" x2="22" y2="12" />
-                </svg>
-                <span>No MP4 files found.<br/>Choose a folder above.</span>
-              </div>
-            )}
-            {localFiles.map((f, i) => (
-              <div
-                key={i}
-                className="media-card vp-video-card"
-                onClick={() => addAssetToTimeline({ filename: f.name, path: f.path }, 'video')}
-                title={f.name}
-              >
-                <video
-                  src={toUrlPath(f.path) + '#t=1'}
-                  muted
-                  preload="metadata"
-                  playsInline
-                  style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#000' }}
-                  onMouseEnter={e => { e.currentTarget.src = toUrlPath(f.path); e.currentTarget.play().catch(() => {}); }}
-                  onMouseLeave={e => { e.currentTarget.pause(); e.currentTarget.src = toUrlPath(f.path) + '#t=1'; }}
-                />
-                <div className="vp-card-overlay">
-                  <div className="vp-play-icon">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="white" stroke="none">
-                      <polygon points="5 3 19 12 5 21 5 3" />
-                    </svg>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <MediaLibrarySection
+          kind="video"
+          accept=".mp4,.mov,.avi,.webm,.mkv"
+          layout="video"
+          addAssetToTimeline={addAssetToTimeline}
+          trackType="video"
+          refreshKey={refreshKey}
+        />
       )}
 
       {/* AVATAR TAB */}
@@ -2234,17 +2304,6 @@ export function VideoPanel({ addAssetToTimeline, toUrlPath, refreshKey }) {
 // ─────────────────────────────────────────────────────────────────────────────
 export function ImagesPanel({ addAssetToTimeline, refreshKey }) {
   const [section, setSection] = useState('local');
-  const [localFolderPath, setLocalFolderPath] = useState(() => localStorage.getItem('image_folder_path') || '');
-  const [folderDisplayName, setFolderDisplayName] = useState(() => localStorage.getItem('image_folder_display') || 'No Folder Selected');
-  const [localFiles, setLocalFiles] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem('image_files') || '[]');
-    } catch {
-      return [];
-    }
-  });
-  const [loadingLocal, setLoadingLocal] = useState(false);
-  const [browsingFolder, setBrowsingFolder] = useState(false);
 
   const [searchKeywords, setSearchKeywords] = useState(() => localStorage.getItem('image_search_keywords') || '');
   const [sources, setSources] = useState(() => {
@@ -2264,12 +2323,6 @@ export function ImagesPanel({ addAssetToTimeline, refreshKey }) {
     }
   });
 
-  // Scan folder if localFolderPath changes
-  useEffect(() => {
-    if (localFolderPath) {
-      scanFolder(localFolderPath);
-    }
-  }, [localFolderPath, refreshKey]);
 
   // Persist search state
   useEffect(() => {
@@ -2288,50 +2341,6 @@ export function ImagesPanel({ addAssetToTimeline, refreshKey }) {
     localStorage.setItem('image_search_limit', searchLimit.toString());
   }, [searchLimit]);
 
-  const toUrlPath = (p) => {
-    if (!p) return '';
-    if (typeof p === 'string' && (p.startsWith('blob:') || p.startsWith('data:') || p.startsWith('http://') || p.startsWith('https://'))) {
-      return p;
-    }
-    const cleanPath = p.replace(/\\/g, '/');
-    const backendOrigin = typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000';
-    return `${backendOrigin}/api/serve-media?path=${encodeURIComponent(cleanPath)}`;
-  };
-
-  const scanFolder = async (folderPath) => {
-    if (!folderPath.trim()) return;
-    setLoadingLocal(true);
-    try {
-      const res = await fetch(`/api/folder-scan?path=${encodeURIComponent(folderPath)}&types=jpg,jpeg,png,webp,gif,bmp`);
-      const data = await res.json();
-      const files = data.files || [];
-      setLocalFiles(files);
-      localStorage.setItem('image_files', JSON.stringify(files));
-    } finally { setLoadingLocal(false); }
-  };
-
-  const browseLocalFolder = async () => {
-    if (browsingFolder) return;
-    setBrowsingFolder(true);
-    try {
-      const res = await fetch('/api/select-folder', { method: 'POST' });
-      const data = await res.json();
-      if (data.status === 'ok' && data.path) {
-        setLocalFolderPath(data.path);
-        const parts = data.path.replace(/\\/g, '/').split('/');
-        const displayName = parts[parts.length - 1] || data.path;
-        setFolderDisplayName(displayName);
-        localStorage.setItem('image_folder_path', data.path);
-        localStorage.setItem('image_folder_display', displayName);
-        scanFolder(data.path);
-      }
-    } catch (e) {
-      console.error('Failed to select folder', e);
-    } finally {
-      setBrowsingFolder(false);
-    }
-  };
-
   const handleSearch = async () => {
     const keywords = searchKeywords.split('\n').map(k => k.trim()).filter(Boolean);
     if (!keywords.length) return;
@@ -2344,14 +2353,14 @@ export function ImagesPanel({ addAssetToTimeline, refreshKey }) {
     for (const kw of keywords) {
       if (sources.pexels) {
         try {
-          const res = await fetch(`/api/search/pexels?query=${encodeURIComponent(kw)}&media_type=photos&per_page=${searchLimit}`);
+          const res = await apiFetch(`/api/search/pexels?query=${encodeURIComponent(kw)}&media_type=photos&per_page=${searchLimit}`);
           const data = await res.json();
           all.push(...(data.results || []).map(r => ({ ...r, keyword: kw, source: 'Pexels' })));
         } catch {}
       }
       if (sources.pixabay) {
         try {
-          const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=photo&per_page=${searchLimit}`);
+          const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=photo&per_page=${searchLimit}`);
           const data = await res.json();
           all.push(...(data.results || []).map(r => ({ ...r, keyword: kw, source: 'Pixabay' })));
         } catch {}
@@ -2380,83 +2389,16 @@ export function ImagesPanel({ addAssetToTimeline, refreshKey }) {
         </button>
       </div>
 
-      {/* LOCAL TAB */}
+      {/* MY MEDIA TAB (user library) */}
       {section === 'local' && (
-        <div className="vp-local-section">
-          {/* Premium Folder Chooser */}
-          <button
-            className={`vp-folder-btn ${browsingFolder ? 'loading' : ''}`}
-            onClick={browseLocalFolder}
-            disabled={browsingFolder}
-            title="Choose folder to scan images"
-          >
-            <div className="vp-folder-btn-icon">
-              {browsingFolder ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="vp-spin">
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  <line x1="12" y1="11" x2="12" y2="17" />
-                  <line x1="9" y1="14" x2="15" y2="14" />
-                </svg>
-              )}
-            </div>
-            <div className="vp-folder-btn-text">
-              <span className="vp-folder-btn-label">
-                {browsingFolder ? 'Opening...' : 'Choose Folder'}
-              </span>
-              <span className="vp-folder-btn-sub">
-                {folderDisplayName}
-              </span>
-            </div>
-            <div className="vp-folder-btn-arrow">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </div>
-          </button>
-
-          {/* Grid Layout */}
-          <div className="media-grid">
-            {loadingLocal && (
-              <div className="vp-loading">
-                <div className="vp-loading-spinner" />
-                <span>Loading images...</span>
-              </div>
-            )}
-            {!loadingLocal && localFiles.length === 0 && (
-              <div className="vp-empty">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                  <circle cx="8.5" cy="8.5" r="1.5" />
-                  <polyline points="21 15 16 10 5 21" />
-                </svg>
-                <span>No images found.<br/>Choose a folder above.</span>
-              </div>
-            )}
-            {localFiles.map((f, i) => (
-              <div
-                key={i}
-                className="media-card"
-                onClick={() => addAssetToTimeline({ filename: f.name, path: f.path }, 'image')}
-                title={f.name}
-              >
-                <img src={toUrlPath(f.path)} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
-                <div className="vp-card-overlay">
-                  <div className="vp-play-icon" style={{ background: 'rgba(0, 132, 255, 0.85)' }}>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-                      <line x1="12" y1="5" x2="12" y2="19" />
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                    </svg>
-                  </div>
-                </div>
-                <div className="media-card-label" style={{ fontSize: '8.5px' }}>{f.name}</div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <MediaLibrarySection
+          kind="image"
+          accept=".jpg,.jpeg,.png,.webp,.gif,.bmp"
+          layout="image"
+          addAssetToTimeline={addAssetToTimeline}
+          trackType="image"
+          refreshKey={refreshKey}
+        />
       )}
 
       {/* SEARCH TAB */}
@@ -2593,17 +2535,6 @@ export function ImagesPanel({ addAssetToTimeline, refreshKey }) {
 // ─────────────────────────────────────────────────────────────────────────────
 export function AudioPanel({ addAssetToTimeline, refreshKey }) {
   const [section, setSection] = useState('local');
-  const [localFolderPath, setLocalFolderPath] = useState(() => localStorage.getItem('audio_folder_path') || '');
-  const [folderDisplayName, setFolderDisplayName] = useState(() => localStorage.getItem('audio_folder_display') || 'No Folder Selected');
-  const [localFiles, setLocalFiles] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem('audio_files') || '[]');
-    } catch {
-      return [];
-    }
-  });
-  const [loadingLocal, setLoadingLocal] = useState(false);
-  const [browsingFolder, setBrowsingFolder] = useState(false);
 
   const [searchKeywords, setSearchKeywords] = useState(() => localStorage.getItem('audio_search_keywords') || '');
   const [searchLimit, setSearchLimit] = useState(() => parseInt(localStorage.getItem('audio_search_limit') || '5'));
@@ -2618,12 +2549,6 @@ export function AudioPanel({ addAssetToTimeline, refreshKey }) {
   const [previewId, setPreviewId] = useState(null);
   const audioRef = useRef(null);
 
-  // Scan folder if localFolderPath changes
-  useEffect(() => {
-    if (localFolderPath) {
-      scanFolder(localFolderPath);
-    }
-  }, [localFolderPath, refreshKey]);
 
   // Persist search state
   useEffect(() => {
@@ -2638,42 +2563,6 @@ export function AudioPanel({ addAssetToTimeline, refreshKey }) {
     localStorage.setItem('audio_search_limit', searchLimit.toString());
   }, [searchLimit]);
 
-  const toAudioUrl = (p) => encodeURI('/' + p.replace(/\\/g, '/'));
-
-  const scanFolder = async (folderPath) => {
-    if (!folderPath.trim()) return;
-    setLoadingLocal(true);
-    try {
-      const res = await fetch(`/api/folder-scan?path=${encodeURIComponent(folderPath)}&types=mp3,wav,ogg,aac`);
-      const data = await res.json();
-      const files = data.files || [];
-      setLocalFiles(files);
-      localStorage.setItem('audio_files', JSON.stringify(files));
-    } finally { setLoadingLocal(false); }
-  };
-
-  const browseLocalFolder = async () => {
-    if (browsingFolder) return;
-    setBrowsingFolder(true);
-    try {
-      const res = await fetch('/api/select-folder', { method: 'POST' });
-      const data = await res.json();
-      if (data.status === 'ok' && data.path) {
-        setLocalFolderPath(data.path);
-        const parts = data.path.replace(/\\/g, '/').split('/');
-        const displayName = parts[parts.length - 1] || data.path;
-        setFolderDisplayName(displayName);
-        localStorage.setItem('audio_folder_path', data.path);
-        localStorage.setItem('audio_folder_display', displayName);
-        scanFolder(data.path);
-      }
-    } catch (e) {
-      console.error('Failed to select folder', e);
-    } finally {
-      setBrowsingFolder(false);
-    }
-  };
-
   const handleSearch = async () => {
     const keywords = searchKeywords.split('\n').map(k => k.trim()).filter(Boolean);
     if (!keywords.length) return;
@@ -2681,7 +2570,7 @@ export function AudioPanel({ addAssetToTimeline, refreshKey }) {
     const all = [];
     for (const kw of keywords) {
       try {
-        const res = await fetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=music&per_page=${searchLimit}`);
+        const res = await apiFetch(`/api/search/pixabay?query=${encodeURIComponent(kw)}&media_type=music&per_page=${searchLimit}`);
         const data = await res.json();
         all.push(...(data.results || []).map(r => ({ ...r, keyword: kw, source: 'Pixabay' })));
       } catch {}
@@ -2722,97 +2611,16 @@ export function AudioPanel({ addAssetToTimeline, refreshKey }) {
         </button>
       </div>
 
-      {/* LOCAL TAB */}
+      {/* MY MEDIA TAB (user library) */}
       {section === 'local' && (
-        <div className="vp-local-section">
-          {/* Premium Folder Chooser */}
-          <button
-            className={`vp-folder-btn ${browsingFolder ? 'loading' : ''}`}
-            onClick={browseLocalFolder}
-            disabled={browsingFolder}
-            title="Choose folder to scan background music"
-          >
-            <div className="vp-folder-btn-icon">
-              {browsingFolder ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="vp-spin">
-                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                </svg>
-              ) : (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  <line x1="12" y1="11" x2="12" y2="17" />
-                  <line x1="9" y1="14" x2="15" y2="14" />
-                </svg>
-              )}
-            </div>
-            <div className="vp-folder-btn-text">
-              <span className="vp-folder-btn-label">
-                {browsingFolder ? 'Opening...' : 'Choose Folder'}
-              </span>
-              <span className="vp-folder-btn-sub">
-                {folderDisplayName}
-              </span>
-            </div>
-            <div className="vp-folder-btn-arrow">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="9 18 15 12 9 6" />
-              </svg>
-            </div>
-          </button>
-
-          {/* Files List */}
-          <div className="sfx-files-list">
-            {loadingLocal && (
-              <div className="vp-loading">
-                <div className="vp-loading-spinner" />
-                <span>Loading background music...</span>
-              </div>
-            )}
-            {!loadingLocal && localFiles.length === 0 && (
-              <div className="vp-empty">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.3 }}>
-                  <path d="M9 18V5l12-2v13" />
-                  <circle cx="6" cy="18" r="3" />
-                  <circle cx="18" cy="16" r="3" />
-                </svg>
-                <span>No background music files found.<br/>Choose a folder above.</span>
-              </div>
-            )}
-            {localFiles.map((f, i) => {
-              const fileUrl = toAudioUrl(f.path);
-              return (
-                <div key={i} className="sfx-file-row">
-                  <button className="sfx-play-btn" onClick={() => togglePreview(fileUrl, f.path)}>
-                    {previewId === f.path ? (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-                        <rect x="4" y="4" width="4" height="16" />
-                        <rect x="16" y="4" width="4" height="16" />
-                      </svg>
-                    ) : (
-                      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: '1px' }}>
-                        <polygon points="5 3 19 12 5 21" />
-                      </svg>
-                    )}
-                  </button>
-                  <div className="sfx-result-info">
-                    <span className="sfx-file-name" title={f.name}>{f.name}</span>
-                    <AudioDuration path={fileUrl} />
-                  </div>
-                  <button
-                    className="sfx-add-btn"
-                    onClick={() => addAssetToTimeline({ filename: f.name, path: f.path }, 'music')}
-                    title="Add to Timeline"
-                  >
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round">
-                      <line x1="12" y1="5" x2="12" y2="19" />
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                    </svg>
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+        <MediaLibrarySection
+          kind="audio"
+          accept=".mp3,.wav,.ogg,.aac,.m4a,.flac"
+          layout="audio"
+          addAssetToTimeline={addAssetToTimeline}
+          trackType="music"
+          refreshKey={refreshKey}
+        />
       )}
 
       {/* SEARCH TAB */}

@@ -1,0 +1,23 @@
+# Yahya AI Studio — backend dependencies
+# Tested with Python 3.12 on Linux and Windows 10.
+# imageio-ffmpeg bundles the ffmpeg binary, so no manual ffmpeg install
+# is needed on Windows.
+fastapi==0.141.1
+uvicorn==0.53.0
+python-multipart==0.0.32
+moviepy==2.2.1
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+pillow==10.2.0
+numpy==1.26.4
+proglog==0.1.12
+edge-tts>=6.1.0
+
+# Phase 1 (accounts): Supabase JWT verification, Supabase REST client,
+# Fernet encryption for per-user API keys.
+pyjwt>=2.8.0
+httpx>=0.27.0
+cryptography>=41.0.0
+
+# Optional — only needed for the Transcribe feature (large download):
+# openai-whisper

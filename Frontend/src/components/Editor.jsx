@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import PropertiesPanel from './PropertiesPanel';
+import { useAuth } from '../auth/AuthContext';
+import { apiFetch } from '../api';
 import { STICKER_CATEGORIES, STICKERS_DATA } from './stickersData';
 import {
   APIKeysPanel,
@@ -1685,7 +1687,8 @@ const TEXT_PRESETS_LIBRARY = [
   }
 ];
 
-export default function Editor({ projectId, setActiveProjectId }) {
+export default function Editor({ projectId, setActiveProjectId, onAccountClick }) {
+  const { user: authUser, isBypass } = useAuth();
   // ─── Helpers ──────────────────────────────────────────────────────────────
   const toUrlPath = (filePath) => {
     if (!filePath) return '';
@@ -1693,13 +1696,21 @@ export default function Editor({ projectId, setActiveProjectId }) {
       return filePath;
     }
     const cleanPath = filePath.replace(/\\/g, '/');
+    const backendOrigin = typeof window !== 'undefined' ? (window.location.port && window.location.port !== '8000' ? `${window.location.protocol}//${window.location.hostname}:8000` : window.location.origin) : 'http://localhost:8000';
+
+    // Already-resolved backend API URL (e.g. "/api/serve-media?path=...").
+    // Resolve it against the backend origin but NEVER wrap it in
+    // /api/serve-media again — double-wrapping 404s and the preview goes black.
+    if (cleanPath.startsWith('/api/') || cleanPath.startsWith('api/')) {
+      const path = cleanPath.startsWith('/') ? cleanPath : '/' + cleanPath;
+      return backendOrigin + encodeURI(path);
+    }
+
     const isStandardMounted = cleanPath.toLowerCase().startsWith('media library/') || 
                               cleanPath.toLowerCase().startsWith('/media library/') ||
                               cleanPath.toLowerCase().startsWith('exports/') ||
                               cleanPath.toLowerCase().startsWith('/exports/');
                               
-    const backendOrigin = typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000';
-    
     if (isStandardMounted) {
       const path = cleanPath.startsWith('/') ? cleanPath : '/' + cleanPath;
       return backendOrigin + encodeURI(path);
@@ -2149,7 +2160,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
       tracks: { track1:[], track2:[], track3:[], track4:[], track5:[], track6:[], track7:[], track8:[] },
     };
     try {
-      const res = await fetch('/api/projects', {
+      const res = await apiFetch('/api/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(proj),
@@ -2167,7 +2178,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
 
   const loadProjects = async () => {
     try {
-      const res = await fetch('/api/projects');
+      const res = await apiFetch('/api/projects');
       if (res.ok) {
         const list = await res.json();
         setProjects(list);
@@ -2188,7 +2199,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
       return;
     }
     try {
-      const res = await fetch(`/api/projects/${projectId}`);
+      const res = await apiFetch(`/api/projects/${projectId}`);
       if (res.ok) {
         const data = await res.json();
         if (data && data.tracks) {
@@ -2233,7 +2244,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
 
   const loadLibrary = async () => {
     try {
-      const res = await fetch('/api/library');
+      const res = await apiFetch('/api/library');
       if (res.ok) setLibrary(await res.json());
     } catch (e) { console.error(e); }
   };
@@ -2242,7 +2253,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
     e.stopPropagation();
     if (!confirm('Are you sure you want to delete this project?')) return;
     try {
-      const res = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/projects/${id}`, { method: 'DELETE' });
       if (res.ok) {
         loadProjects();
         if (projectId === id) { setActiveProjectId(null); setProject(null); }
@@ -2260,7 +2271,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
   const saveProject = async (p = project) => {
     if (!p) return;
     try {
-      await fetch('/api/projects', {
+      await apiFetch('/api/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(p),
@@ -2321,7 +2332,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
       const fd = new FormData();
       fd.append('file', file);
       try {
-        const response = await fetch('/api/upload/smart', {
+        const response = await apiFetch('/api/upload/smart', {
           method: 'POST',
           body: fd
         });
@@ -2329,7 +2340,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
           const data = await response.json();
           const trackType = data.type || (file.type.startsWith('video') ? 'video' : file.type.startsWith('image') ? 'image' : 'audio');
           addAssetToTimeline({
-            path: data.saved_path || data.file_path || file.name,
+            path: data.saved_path || data.signed_url || data.file_path || file.name,
             filename: data.filename || file.name,
           }, trackType);
         } else {
@@ -2361,7 +2372,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
       const fd = new FormData();
       fd.append('file', file);
       try {
-        const response = await fetch('/api/upload/smart', {
+        const response = await apiFetch('/api/upload/smart', {
           method: 'POST',
           body: fd
         });
@@ -2369,7 +2380,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
           const data = await response.json();
           const trackType = data.type; // 'video', 'image', 'audio'
           addAssetToTimeline({
-            path: data.saved_path || data.file_path,
+            path: data.saved_path || data.signed_url || data.file_path,
             filename: data.filename || file.name,
           }, trackType);
         } else {
@@ -3135,7 +3146,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
     fd.append('file', file);
     fd.append('type', type);
     try {
-      const res = await (await fetch('/api/upload', { method: 'POST', body: fd })).json();
+      const res = await (await apiFetch('/api/upload', { method: 'POST', body: fd })).json();
       if (res.status === 'success') { loadLibrary(); alert('Uploaded successfully!'); }
     } catch (e) { console.error(e); }
     finally { setIsUploading(false); }
@@ -3227,7 +3238,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
     const fd = new FormData();
     fd.append('file', srtFile);
     try {
-      const data = await (await fetch('/api/captions/srt', { method: 'POST', body: fd })).json();
+      const data = await (await apiFetch('/api/captions/srt', { method: 'POST', body: fd })).json();
       if (data.status === 'success') {
         pushHistory(project.tracks);
         const clips = data.segments.map((s, i) => ({
@@ -3247,7 +3258,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
   const generateCaptionsFromScript = async () => {
     if (!scriptText.trim()) return;
     try {
-      const data = await (await fetch('/api/captions/script', {
+      const data = await (await apiFetch('/api/captions/script', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ script_text: scriptText, duration: project.duration }),
@@ -3286,7 +3297,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
     try {
       const fd = new FormData();
       fd.append('audio_path', audioPath);
-      const data = await (await fetch('/api/captions/auto', { method: 'POST', body: fd })).json();
+      const data = await (await apiFetch('/api/captions/auto', { method: 'POST', body: fd })).json();
       if (data.status === 'success') {
         pushHistory(project.tracks);
         const clips = data.segments.map((s, i) => ({
@@ -3590,7 +3601,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
 
     const payload = { project_id: project.id, timeline: processedTracks, resolution: res, fps: parseInt(exportFps), quality: exportQuality, format: 'mp4' };
     try {
-      const data = await (await fetch('/api/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })).json();
+      const data = await (await apiFetch('/api/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })).json();
       if (data.status === 'queued') setRenderingTaskId(data.task_id);
     } catch (e) { console.error(e); alert('Rendering failed to start.'); }
   };
@@ -3600,7 +3611,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
     let timer;
     const poll = async () => {
       try {
-        const res = await fetch(`/api/status/${renderingTaskId}`);
+        const res = await apiFetch(`/api/status/${renderingTaskId}`);
         if (res.ok) {
           const st = await res.json();
           setRenderStatus(st);
@@ -3921,7 +3932,7 @@ export default function Editor({ projectId, setActiveProjectId }) {
             )}
 
             {activeSidebar === 'Assets' && (
-              <AssetsPanel addAssetToTimeline={addAssetToTimeline} library={library} />
+              <AssetsPanel addAssetToTimeline={addAssetToTimeline} />
             )}
 
             {activeSidebar === 'SFX' && (
@@ -3932,7 +3943,6 @@ export default function Editor({ projectId, setActiveProjectId }) {
             {activeSidebar === 'Video' && (
               <VideoPanel
                 addAssetToTimeline={addAssetToTimeline}
-                toUrlPath={toUrlPath}
                 refreshKey={projectId}
               />
             )}
@@ -4568,6 +4578,9 @@ export default function Editor({ projectId, setActiveProjectId }) {
           </div>
 
           <div className="header-actions">
+            <button className="header-action-btn account-btn" onClick={onAccountClick} title={authUser?.email || 'Account'}>
+              👤 {isBypass ? 'Local' : (authUser?.email ? authUser.email.split('@')[0] : 'Account')}
+            </button>
             {project && (
               <button className="header-action-btn export-btn btn-gold" onClick={() => setExportModal(true)} title="Export Video">
                 🎬 Export

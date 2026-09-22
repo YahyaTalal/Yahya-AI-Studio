@@ -1,9 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import './App.css';
 import Editor from './components/Editor';
+import { AuthProvider, useAuth } from './auth/AuthContext';
+import Login from './auth/Login';
+import Signup from './auth/Signup';
+import Account from './auth/Account';
 
-export default function App() {
-  const [appLoading, setAppLoading] = useState(true);
+function AppShell() {
+  const { user, loading } = useAuth();
+  const [splashDone, setSplashDone] = useState(false);
+  const [authView, setAuthView] = useState('login');
+  const [showAccount, setShowAccount] = useState(false);
   const [activeProjectId, setActiveProjectId] = useState(() => {
     return localStorage.getItem('activeProjectId') || null;
   });
@@ -11,7 +18,7 @@ export default function App() {
   // Mock initial startup fade
   useEffect(() => {
     const timer = setTimeout(() => {
-      setAppLoading(false);
+      setSplashDone(true);
     }, 1500);
     return () => clearTimeout(timer);
   }, []);
@@ -25,8 +32,13 @@ export default function App() {
     }
   }, [activeProjectId]);
 
-  // 1. Startup Loader Screen
-  if (appLoading) {
+  // Reset auth view when the user signs out
+  useEffect(() => {
+    if (!user) setAuthView('login');
+  }, [user]);
+
+  // 1. Startup Loader Screen (also covers auth check)
+  if (!splashDone || loading) {
     return (
       <div className="loading-screen">
         <img src="/logo.jpg" alt="Logo" className="loading-logo" />
@@ -37,11 +49,30 @@ export default function App() {
     );
   }
 
-  // 2. Multi-track Editor Workspace Screen
+  // 2. Not signed in → Login / Signup screens
+  if (!user) {
+    return authView === 'login'
+      ? <Login onSwitchToSignup={() => setAuthView('signup')} />
+      : <Signup onSwitchToLogin={() => setAuthView('login')} />;
+  }
+
+  // 3. Signed in (or bypass mode) → Multi-track Editor Workspace Screen
   return (
-    <Editor 
-      projectId={activeProjectId} 
-      setActiveProjectId={setActiveProjectId}
-    />
+    <>
+      <Editor
+        projectId={activeProjectId}
+        setActiveProjectId={setActiveProjectId}
+        onAccountClick={() => setShowAccount(true)}
+      />
+      {showAccount && <Account onClose={() => setShowAccount(false)} />}
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppShell />
+    </AuthProvider>
   );
 }

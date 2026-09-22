@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Frontend
+Frontend/node_modules/
+Frontend/dist/
+
+# App data (user media, projects, exports) — never commit
+Media Library/
+Projects/
+Exports/
+exports/
+*.mp4
+*.mp3
+*.wav
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local env
+.env

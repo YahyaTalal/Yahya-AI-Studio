@@ -690,7 +690,7 @@ export default function PropertiesPanel({ selectedClip, onChange, onClose, onDel
                               cleanPath.toLowerCase().startsWith('exports/') ||
                               cleanPath.toLowerCase().startsWith('/exports/');
                               
-    const backendOrigin = typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8000` : 'http://localhost:8000';
+    const backendOrigin = typeof window !== 'undefined' ? (window.location.port && window.location.port !== '8000' ? `${window.location.protocol}//${window.location.hostname}:8000` : window.location.origin) : 'http://localhost:8000';
     
     if (isStandardMounted) {
       const path = cleanPath.startsWith('/') ? cleanPath : '/' + cleanPath;
